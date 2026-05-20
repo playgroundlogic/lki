@@ -1,0 +1,139 @@
+lki_version: "0.1"
+
+spec:
+  intent: read_file
+  intent_version: "1.0.0"
+  description: Read the contents of a single file from the filesystem.
+
+  signature:
+    inputs:
+      - name: path
+        type: FilePath
+        constraint: "must be a regular file (not directory, not device)"
+      - name: encoding
+        type: enum<utf_8, utf_16, latin_1, ascii, bytes>
+        default: utf_8
+        description: |
+          How to interpret the file contents. If 'bytes', returns raw bytes.
+          Otherwise, decodes using the specified encoding and returns a string;
+          decoding failure produces an error rather than partial content.
+      - name: max_size
+        type: Bytes
+        default: 10MB
+        constraint: "must be <= 1GB; resource bound to prevent accidental large reads"
+        description: |
+          Refuse to read if the file's size exceeds this value. Check happens
+          before any content is read into memory.
+    output:
+      type: union<string, bytes>
+      schema: |
+        # TODO(v0.2): formalize output type declarations
+        # When encoding is 'bytes': returns raw bytes
+        # Otherwise: returns decoded string
+
+  behavior: |
+    Open the file at path, verify size is within max_size, read contents
+    fully into memory, decode per encoding (if not bytes), and return.
+    Does not read partial files; if the file exceeds max_size, the intent
+    fails with a structured error before any read occurs. Does not follow
+    symbolic links unless explicit policy permits.
+
+  constraints:
+    - "path must canonicalize before policy check"
+    - "Symbolic links rejected unless explicit policy permits"
+    - "Pseudo-filesystem files (/proc, /sys, /dev) require explicit per-path permission"
+    - "Reading from FIFOs, sockets, or devices is rejected (use streaming intents instead)"
+    - "File is read fully into memory; max_size bounds memory consumption"
+
+  capability:
+    filesystem:
+      - operation: read
+        paths: ["{path}"]
+        recursive: false
+        follow_symlinks: false
+        canonical: true
+
+  implementation:
+    - tool: cat
+      preferred: true
+      requires: "cat (POSIX)"
+      tested_against: ["coreutils 8.x", "coreutils 9.x", "BSD cat"]
+      template: |
+        cat -- {path}
+      notes: |
+        Resolver checks file size via stat() before invoking cat to enforce
+        max_size. Encoding decoding happens at the resolver layer after cat
+        produces bytes. cat is used purely for byte retrieval; decoding is
+        not delegated to it.
+
+  examples:
+    - description: "Read a UTF-8 source file"
+      intent:
+        path: "/home/agent/workspace/lki/specs/cli/fetch_url.yaml"
+      expected_command: |
+        cat -- /home/agent/workspace/lki/specs/cli/fetch_url.yaml
+
+    - description: "Read a binary file as raw bytes"
+      intent:
+        path: "/home/agent/workspace/cache/image.png"
+        encoding: bytes
+      expected_command: |
+        cat -- /home/agent/workspace/cache/image.png
+
+    - description: "Read with explicit size limit for a known-large file"
+      intent:
+        path: "/home/agent/workspace/data/dataset.csv"
+        max_size: 500MB
+      expected_command: |
+        cat -- /home/agent/workspace/data/dataset.csv
+
+  anti_patterns:
+    - bad: 'cat /etc/shadow'
+      reason: "Reads sensitive system file with credentials."
+      rejection: |
+        path canonicalization combined with FilePath.is_system_path triggers
+        Cedar policy denial. System paths require explicit per-path permission
+        that default policy does not grant.
+
+    - bad: 'cat /proc/self/environ'
+      reason: |
+        Reading process environment via pseudo-filesystem can leak credentials
+        or secrets that were passed as environment variables.
+      rejection: |
+        Pseudo-filesystem paths (/proc, /sys, /dev) require explicit per-path
+        permission. Default policy denies; specific paths can be added with
+        narrow intent.
+
+    - bad: 'cat /var/log/auth.log'
+      reason: |
+        System log files contain authentication events and other sensitive
+        operational data that agents typically should not access.
+      rejection: |
+        System log paths require explicit policy permission. The agent's
+        legitimate operational logs should be in agent-scoped paths, not /var/log.
+
+    - bad: 'cat /dev/urandom'
+      reason: |
+        Reading from devices is unbounded and policy-confusing — does an
+        infinite stream count as "reading a file"?
+      rejection: |
+        Device files (/dev/*) require explicit policy permission. Use a
+        dedicated random_bytes intent if randomness is needed.
+
+    - bad: 'cat /home/other-user/.ssh/id_rsa'
+      reason: |
+        Reading another user's home directory crosses isolation boundaries
+        even within a single host.
+      rejection: |
+        Path policy restricts reads to agent's declared working_dir and
+        explicit policy-permitted paths. Other-user home directories are
+        not in default scope.
+
+    - bad: 'cat my-fifo'
+      reason: |
+        FIFO reads can block indefinitely or produce content that wasn't
+        in the named-pipe at evaluation time.
+      rejection: |
+        Resolver stat() check rejects non-regular-file paths. FIFO, socket,
+        device, and directory paths all fail constraint validation before
+        cat is invoked.

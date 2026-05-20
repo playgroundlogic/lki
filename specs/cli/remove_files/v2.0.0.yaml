@@ -1,0 +1,208 @@
+lki_version: "0.2"
+
+spec:
+  intent: remove_files
+  intent_version: "2.0.0"
+  description: Delete one or more files or directories from the filesystem.
+
+  types:
+    DeletionResult:
+      type_version: "1.0.0"
+      structural_attributes:
+        path:
+          type: FilePath@1.x
+          description: "The path that was processed"
+        status:
+          type: enum<deleted, not_found, denied, error>
+        error_message:
+          type: string
+          description: "Empty when status is 'deleted' or 'not_found'"
+
+  signature:
+    inputs:
+      - name: paths
+        type: list<FilePath@1.x>
+        constraint: "minimum 1; each path absolute or resolved against declared working_dir"
+      - name: recursive
+        type: bool
+        default: false
+        description: |
+          Required true for directory deletion. If any path is a directory
+          and recursive is false, the intent is rejected before execution.
+      - name: force
+        type: bool
+        default: false
+        description: |
+          Suppress errors for nonexistent paths. Does NOT bypass any policy.
+          Granted permissions are evaluated independently.
+    output:
+      type: list<DeletionResult@1.x>
+      streaming: bounded
+
+  behavior: |
+    Permanently remove the specified files or directories. Deletion is
+    per-path; a denial or error on one path does not prevent processing
+    of others. Returns structured results per path.
+
+    State-mutation semantics (informational; not enforced as a
+    state_mutation capability in v2.0.0):
+      - visibility: immediate (deletion visible to other processes as
+        soon as unlink() returns)
+      - durability: committed (filesystem journal records the deletion)
+      - reversibility: irreversible (no trash, no recovery from this
+        intent's perspective; filesystem-level recovery tools may
+        recover recently-deleted blocks but that's outside LKI scope)
+
+    Behavioral guarantees (normative for the contract):
+      - Symbolic links are unlinked, not followed -- deletion never
+        propagates outside the explicit path set
+      - Cannot delete the current working directory or any ancestor of
+        working_dir
+      - Deletion is irreversible; no trash/recycle behavior
+
+  constraints:
+    parameter_constraints: []
+    cross_parameter_constraints:
+      - description: "Directory deletion requires recursive flag"
+        rule: "(paths.any_is_directory) implies recursive == true"
+
+  capability:
+    filesystem:
+      - operation: delete
+        paths: "{paths}"
+        recursive: "{recursive}"
+        follow_symlinks: false
+        canonical: true
+        purpose: user_facing
+        recursion_safety:
+          cycle_prevention: required
+          max_depth: 50
+          visited_set: by_canonical_path
+
+  resolver_constraints:
+    shell_metacharacter_rejection:
+      - parameter: paths
+        rule: "no shell metacharacters ($, `, ;, |, &, <, >, *, ?, [, newline) in path strings"
+        reason: "Prevent shell injection in templates"
+    path_traversal_rejection:
+      - parameter: paths
+        rule: "paths with .. components rejected unless explicit policy permits traversal"
+        reason: "Path canonicalization before policy check; canonical path must satisfy policy bounds"
+    working_dir_safety:
+      - parameter: paths
+        rule: "no path may be the current working directory or any ancestor of working_dir"
+        reason: "Prevent self-destruction of the resolver's execution context"
+
+  internal_behaviors:
+    cache_invalidation:
+      - description: "Kernel dentry and page cache entries for deleted paths are invalidated"
+        controllable_via_parameter: false
+        policy_relevance: "Cache invalidation is automatic; not a policy concern"
+
+  implementation:
+    - tool: rm
+      priority: 100
+      requires: "rm (POSIX)"
+      tested_against: ["coreutils 8.x", "coreutils 9.x", "BSD rm"]
+      template: |
+        rm {recursive_flag} {force_flag} -- {paths[ ]}
+      parameter_mapping:
+        recursive_flag:
+          cases:
+            - when: "recursive == true"
+              value: "-r"
+            - default:
+              value: ""
+        force_flag:
+          cases:
+            - when: "force == true"
+              value: "-f"
+            - default:
+              value: ""
+      notes: |
+        The -- separator prevents path arguments from being interpreted as
+        flags even if a resolved path begins with a hyphen.
+
+  examples:
+    - description: "Delete a single file"
+      intent:
+        paths: ["/tmp/build-output.log"]
+      expected_command: |
+        rm   -- /tmp/build-output.log
+
+    - description: "Remove an intermediate build directory recursively"
+      intent:
+        paths: ["./build/intermediate"]
+        recursive: true
+      expected_command: |
+        rm -r  -- ./build/intermediate
+
+    - description: "Clean multiple known temp files, tolerate missing"
+      intent:
+        paths: ["/tmp/cache-1", "/tmp/cache-2", "/tmp/cache-3"]
+        force: true
+      expected_command: |
+        rm  -f -- /tmp/cache-1 /tmp/cache-2 /tmp/cache-3
+
+    - description: "Remove a directory and its contents with both flags"
+      intent:
+        paths: ["./node_modules"]
+        recursive: true
+        force: true
+      expected_command: |
+        rm -r -f -- ./node_modules
+
+  anti_patterns:
+    - bad: 'rm -rf /'
+      reason: "Recursive root deletion."
+      rejection: |
+        Root path satisfies !FilePath.is_within_working_dir AND
+        FilePath.is_system_path = true. Both Cedar safety floor policies
+        forbid this combination; either policy alone would deny.
+
+    - bad: 'rm -rf $VAR'
+      reason: |
+        Unbounded variable expansion. If $VAR is empty or unset, expands
+        to 'rm -rf', causing undefined behavior.
+      rejection: |
+        Intent declares paths as a typed list, not a string subject to
+        shell expansion. Empty list is rejected at parameter parsing
+        (constraint: "minimum 1") with explicit error.
+
+    - bad: 'rm -rf "${BUILD_DIR}/output"'
+      reason: |
+        If BUILD_DIR is unset, expands to '/output', which then attempts
+        to delete /output.
+      rejection: |
+        Path resolution happens at intent construction. Tool-SI emits
+        literal resolved paths to the executor; the executor never
+        performs shell variable expansion on path arguments.
+
+    - bad: 'rm /var/log/*.log'
+      reason: "Glob expansion is shell-mediated and invisible to policy."
+      rejection: |
+        Globs expanded at intent construction with the resolved list of
+        paths visible to Cedar policy. The executor receives the literal
+        resolved list, not the glob.
+
+    - bad: 'rm -rf ../../../sensitive-data'
+      reason: "Path traversal."
+      rejection: |
+        resolver_constraints.path_traversal_rejection rejects .. components
+        unless explicit traversal policy permits. Canonicalization happens
+        before policy check; canonical path must satisfy policy bounds.
+
+    - bad: 'rm -rf /tmp/$(whoami)'
+      reason: "Command substitution in path argument."
+      rejection: |
+        resolver_constraints.shell_metacharacter_rejection rejects $, `,
+        and other command substitution characters before any other
+        processing.
+
+    - bad: 'rm /etc/cron.d/*'
+      reason: |
+        Even with a literal glob in a system directory, this is
+        privilege-relevant deletion.
+      rejection: |
+        path canonicalization combined with FilePath.is_system_path = true
+        (covering /etc tree) triggers Cedar safety floor policy denial.

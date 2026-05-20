@@ -1,0 +1,242 @@
+# Runtime PDP query shape for commit_changes
+# LKI format version: 0.1
+#
+# This shows how a single commit_changes intent invocation translates into
+# multiple Cedar evaluation requests at runtime. Unlike fetch_url which
+# produced 2 PDP queries, commit_changes produces 5 — and all five must
+# return Allow for the intent to proceed.
+
+# ============================================================================
+# Scenario: Agent commits work to the LKI repository
+# ============================================================================
+
+intent:
+  name: commit_changes
+  version: "1.0.0"
+  parameters:
+    repository_path: "/home/agent/workspace/lki"
+    message: "Add write_file spec draft"
+    paths:
+      - "specs/cli/write_file.yaml"
+
+principal:
+  id: "agent-session-abc123"
+  labels: ["developer"]
+  working_dir: "/home/agent/workspace"
+  session_id: "sess-2026-05-19-001"
+
+# ============================================================================
+# Request-time state observation
+# ============================================================================
+#
+# The resolver inspects the git repository at /home/agent/workspace/lki to
+# populate GitRepository entity attributes BEFORE constructing PDP queries.
+# This is "state at request time" — captured once, attached to the entity,
+# used by all PDP queries for this intent invocation.
+
+observed_state:
+  GitRepository:
+    canonical_path: "/home/agent/workspace/lki"
+    working_dir_rooted: true             # /home/agent/workspace is principal.working_dir
+    current_branch: "main"
+    has_uncommitted_changes: true
+    is_detached_head: false
+    has_in_progress_operation: false
+    remote_count: 1
+
+  Tool:
+    name: "git"
+    is_system_critical: false
+    version_available: "2.42.0"
+
+# ============================================================================
+# Resolver: expand capability section against concrete parameter values
+# ============================================================================
+#
+# Note: commit_changes has 4 capability declarations, but two of them
+# (filesystem.read with two paths, filesystem.write) expand into multiple
+# PDP queries because they list multiple resources. This is the
+# "one capability declaration produces N PDP queries" pattern that became
+# F-029 in the findings doc.
+
+resolved_capabilities:
+  - source: "filesystem.read[0]"
+    purpose: "implementation_detail"
+    paths:
+      - "/home/agent/workspace/lki/.git"
+      - "/home/agent/workspace/lki"
+
+  - source: "filesystem.write[0]"
+    purpose: "implementation_detail"
+    paths:
+      - "/home/agent/workspace/lki/.git"
+
+  - source: "state_mutation[0]"
+    resource: "git_repository:/home/agent/workspace/lki"
+    operation: "commit"
+    reversible: true
+
+  - source: "process[0]"
+    tool: "git"
+    uid_required: "current"
+
+# ============================================================================
+# PDP requests: one per resolved capability instance
+# ============================================================================
+
+# Request 1: Read .git directory
+pdp_request_1:
+  principal: Lki::Principal::"agent-session-abc123"
+  action: Lki::Action::"Filesystem::Read"
+  resource: Lki::FilePath::"/home/agent/workspace/lki/.git"
+  context:
+    recursive: true
+    follow_symlinks: false
+    intent_name: "commit_changes"
+    intent_version: "1.0.0"
+    purpose: "implementation_detail"
+  expected_decision: Allow
+  matching_policies:
+    - "baseline-fs-read-implementation-detail-within-working-dir"
+
+# Request 2: Read repository working tree
+pdp_request_2:
+  principal: Lki::Principal::"agent-session-abc123"
+  action: Lki::Action::"Filesystem::Read"
+  resource: Lki::FilePath::"/home/agent/workspace/lki"
+  context:
+    recursive: true
+    follow_symlinks: false
+    intent_name: "commit_changes"
+    intent_version: "1.0.0"
+    purpose: "implementation_detail"
+  expected_decision: Allow
+  matching_policies:
+    - "baseline-fs-read-implementation-detail-within-working-dir"
+
+# Request 3: Write .git directory (commit object, refs, index updates)
+pdp_request_3:
+  principal: Lki::Principal::"agent-session-abc123"
+  action: Lki::Action::"Filesystem::Write"
+  resource: Lki::FilePath::"/home/agent/workspace/lki/.git"
+  context:
+    recursive: true
+    follow_symlinks: false
+    intent_name: "commit_changes"
+    intent_version: "1.0.0"
+    purpose: "implementation_detail"
+  expected_decision: Allow
+  matching_policies:
+    - "baseline-fs-write-implementation-detail-within-working-dir"
+
+# Request 4: State mutation of the git repository
+pdp_request_4:
+  principal: Lki::Principal::"agent-session-abc123"
+  action: Lki::Action::"StateMutation::Write::Git"
+  resource: Lki::GitRepository::"/home/agent/workspace/lki"
+  context:
+    operation: "commit"
+    reversible: true
+    intent_name: "commit_changes"
+    intent_version: "1.0.0"
+    message_subject_length: 25
+    files_affected_count: 1
+  expected_decision: Allow
+  matching_policies:
+    - "baseline-git-commit-in-working-dir"
+  policies_NOT_matching:
+    - "safety-floor-not-working-dir-rooted"     # working_dir_rooted is true
+    - "safety-floor-detached-head"               # is_detached_head is false
+    - "safety-floor-in-progress-operation"       # has_in_progress_operation is false
+
+# Request 5: Spawn the git tool
+pdp_request_5:
+  principal: Lki::Principal::"agent-session-abc123"
+  action: Lki::Action::"Process::Spawn"
+  resource: Lki::Tool::"git"
+  context:
+    uid_required: "current"
+    intent_name: "commit_changes"
+    intent_version: "1.0.0"
+    arg_count: 4   # git, commit, --message, "..."
+  expected_decision: Allow
+  matching_policies:
+    - "baseline-spawn-git-for-commit-changes"
+
+# ============================================================================
+# Intent-level decision: atomic across all 5 PDP queries
+# ============================================================================
+#
+# Per F-006 (intent-level atomicity), ALL five queries must return Allow
+# for the intent to proceed. If any returns Deny, the entire intent fails
+# atomically with a structured error indicating which capability was denied.
+
+intent_decision:
+  outcome: Allow
+  pdp_query_count: 5
+  all_allowed: true
+  resolver_proceeds: true
+
+# Counter-example: if the repo were on a protected branch, the tenant
+# template policy would forbid request 4, and the intent would fail:
+counter_example:
+  scenario: "Repository on 'main' branch with tenant policy forbidding commits to main"
+  pdp_request_4_decision: Deny
+  determining_policy: "tenant-no-commits-to-protected-branches"
+  intent_outcome: Deny
+  partial_state: "none"   # no commit attempted; git was not spawned
+  error_returned_to_caller: |
+    {
+      "intent": "commit_changes@1.0.0",
+      "decision": "Deny",
+      "denied_capability": "state_mutation[0]",
+      "denied_resource": "git_repository:/home/agent/workspace/lki",
+      "determining_policy": "tenant-no-commits-to-protected-branches",
+      "policy_reason": "commits to 'main' branch require explicit override"
+    }
+
+# ============================================================================
+# Audit log entry (one per intent invocation, regardless of outcome)
+# ============================================================================
+
+audit_entry:
+  timestamp: "2026-05-19T10:23:11.482Z"
+  principal_id: "agent-session-abc123"
+  session_id: "sess-2026-05-19-001"
+  intent_name: "commit_changes"
+  intent_version: "1.0.0"
+  intent_parameters:
+    repository_path: "/home/agent/workspace/lki"
+    message: "Add write_file spec draft"
+    paths: ["specs/cli/write_file.yaml"]
+  observed_state:
+    "GitRepository:/home/agent/workspace/lki":
+      current_branch: "main"
+      is_detached_head: false
+      has_in_progress_operation: false
+  resolved_capabilities:
+    - "Filesystem::Read on /home/agent/workspace/lki/.git (implementation_detail)"
+    - "Filesystem::Read on /home/agent/workspace/lki (implementation_detail)"
+    - "Filesystem::Write on /home/agent/workspace/lki/.git (implementation_detail)"
+    - "StateMutation::Write::Git on /home/agent/workspace/lki (commit, reversible)"
+    - "Process::Spawn on Tool::git (uid current)"
+  pdp_decisions:
+    - request: 1
+      decision: "Allow"
+      determining_policies: ["baseline-fs-read-implementation-detail-within-working-dir"]
+    - request: 2
+      decision: "Allow"
+      determining_policies: ["baseline-fs-read-implementation-detail-within-working-dir"]
+    - request: 3
+      decision: "Allow"
+      determining_policies: ["baseline-fs-write-implementation-detail-within-working-dir"]
+    - request: 4
+      decision: "Allow"
+      determining_policies: ["baseline-git-commit-in-working-dir"]
+    - request: 5
+      decision: "Allow"
+      determining_policies: ["baseline-spawn-git-for-commit-changes"]
+  intent_outcome: "Allow"
+  execution_result: "success"
+  execution_duration_ms: 412
+  commit_hash: "8f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a"   # populated post-execution

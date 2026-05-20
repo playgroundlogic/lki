@@ -1,0 +1,29 @@
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor temp files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Build artifacts (when tooling lands)
+/build/
+/dist/
+/bin/
+
+# Local scratch
+/scratch/
+/tmp/
+
+# Python (for any local tooling scripts)
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Go (for any local tooling)
+/vendor/
+*.test

@@ -1,0 +1,278 @@
+lki_version: "0.1"
+
+spec:
+  intent: write_file
+  intent_version: "1.0.0"
+  description: Write content to a file on the filesystem, atomically when possible.
+
+  signature:
+    inputs:
+      - name: path
+        type: FilePath
+        constraint: "must be writable per policy; parent directory must exist unless create_parents is true"
+      - name: content
+        type: union<string, bytes>
+        description: |
+          Content to write. If string, encoded per encoding parameter before write.
+          If bytes, written directly.
+      - name: encoding
+        type: enum<utf_8, utf_16, latin_1, ascii>
+        default: utf_8
+        description: |
+          Used only when content is a string. Ignored if content is bytes.
+          Encoding failure produces an error before any write occurs.
+      - name: mode
+        type: enum<replace, append, create_new>
+        default: replace
+        description: |
+          replace: write content as the full file contents, overwriting existing
+          append: add content to end of existing file; creates if absent
+          create_new: write only if file does not exist; fails atomically if it does
+      - name: create_parents
+        type: bool
+        default: false
+        description: |
+          If true, missing parent directories are created (mkdir -p semantics).
+          Created directories use the principal's umask.
+      - name: permissions
+        type: string
+        optional: true
+        constraint: "must be 3 or 4 octal digits, e.g. '0644', '755'"
+        description: |
+          Explicit file permissions to set after write. If omitted, permissions
+          are determined by the umask and the file's prior mode (for replace
+          and append modes).
+      - name: atomic
+        type: bool
+        default: true
+        description: |
+          If true, write via temp-file-and-rename to ensure atomicity. The file
+          either exists with the new content or remains in its prior state;
+          partial writes are not visible. atomic=false is faster but allows
+          partial writes to be observable if the process is interrupted.
+      - name: fsync
+        type: bool
+        default: false
+        description: |
+          If true, fsync the file before considering the write complete. Adds
+          latency but guarantees the write survives a power failure or kernel
+          crash. Most agent workloads do not need this.
+    output:
+      type: WriteResult
+      schema: |
+        # TODO(v0.2): formalize output type declarations
+        WriteResult {
+          path: FilePath           # canonical path of the written file
+          bytes_written: int       # actual bytes written to disk (post-encoding)
+          created: bool            # true if the file did not exist before
+          mode: string             # octal permissions of the file after write
+        }
+
+  behavior: |
+    Write content to path. Behavior depends on mode:
+      - replace: content becomes the entire file contents
+      - append: content is added to end of file; file is created if absent
+      - create_new: content is written only if file does not exist; intent fails
+        atomically if it does, no partial state
+    When atomic is true (the default), the write happens via temp-file-and-rename
+    so the file's state is never partially-written from another process's view.
+    Optional fsync forces durability. Encoding is applied before write if content
+    is a string; encoding failure aborts the operation before any disk activity.
+
+  constraints:
+    - "path must canonicalize and pass policy check before any write occurs"
+    - "Symbolic links rejected unless explicit policy permits writing through them"
+    - "System paths (/etc, /usr, /bin, /sbin, /var, /boot, /lib, /lib64) require explicit policy permission"
+    - "Pseudo-filesystem paths (/proc, /sys) require explicit policy permission"
+    - "Content size + encoding overhead must not exceed available filesystem space"
+    - "Atomic mode requires write permission to the parent directory (for the temp file)"
+    - "Permissions parameter cannot grant world-write without explicit policy permission"
+
+  capability:
+    filesystem:
+      - operation: write
+        paths: ["{path}"]
+        recursive: false
+        follow_symlinks: false
+        canonical: true
+        description: "Write to the target file at its canonical path"
+      - operation: write
+        paths: ["{path.parent}"]
+        recursive: false
+        follow_symlinks: false
+        canonical: true
+        required_if: "atomic is true or create_parents is true"
+        description: |
+          Parent directory write needed for atomic temp-file creation or
+          for mkdir -p when create_parents is true. Always required in
+          default (atomic=true) configuration.
+
+  implementation:
+    - tool: write
+      preferred: true
+      requires: "shell built-ins (sh) plus mv, mkdir"
+      tested_against: ["sh (POSIX)", "bash 5.x", "dash"]
+      template: |
+        {parents_command}
+        {write_command}
+        {permissions_command}
+        {fsync_command}
+      parameter_mapping:
+        parents_command:
+          create_parents_true: "mkdir -p -- {path.parent} && "
+          create_parents_false: ""
+        write_command:
+          atomic_replace: |
+            tmpfile=$(mktemp --tmpdir={path.parent} ".{path.basename}.XXXXXX") && 
+            printf '%s' {content[shell_quoted]} > "$tmpfile" && 
+            mv -- "$tmpfile" {path}
+          atomic_append: |
+            # append is not strictly atomic in the temp-file sense; append-O_APPEND
+            # is atomic at the syscall level for small writes (< PIPE_BUF on most systems)
+            printf '%s' {content[shell_quoted]} >> {path}
+          atomic_create_new: |
+            # set -C (noclobber) makes redirection fail if file exists
+            ( set -C; printf '%s' {content[shell_quoted]} > {path} )
+          nonatomic_replace: |
+            printf '%s' {content[shell_quoted]} > {path}
+          nonatomic_append: |
+            printf '%s' {content[shell_quoted]} >> {path}
+          nonatomic_create_new: |
+            ( set -C; printf '%s' {content[shell_quoted]} > {path} )
+        permissions_command:
+          permissions_set: " && chmod {permissions} -- {path}"
+          permissions_omitted: ""
+        fsync_command:
+          fsync_true: " && sync {path}"
+          fsync_false: ""
+      notes: |
+        Several format-pressure points here documented as findings:
+        - The parameter_mapping has more discriminators than v0.1 cleanly
+          supports (atomic × mode produces 6 cases)
+        - Encoding is not represented in the template — the resolver
+          encodes content before substitution
+        - The temp file naming (.basename.XXXXXX) is a convention to
+          avoid leaving visible temp files in directory listings
+
+    - tool: dd
+      requires: "dd (POSIX)"
+      limitations:
+        - "Less natural for atomic-rename pattern"
+        - "Awkward for shell-quoted content (better for binary)"
+      notes: |
+        Alternative implementation when shell redirection is unsuitable
+        (very large content, binary content with embedded nulls). Resolver
+        selects when content is bytes and length exceeds shell-arg limits.
+
+  examples:
+    - description: "Write a small text file, replacing if it exists"
+      intent:
+        path: "/home/agent/workspace/output.txt"
+        content: "Hello, LKI.\n"
+      expected_command: |
+        tmpfile=$(mktemp --tmpdir=/home/agent/workspace ".output.txt.XXXXXX") && 
+        printf '%s' 'Hello, LKI.
+        ' > "$tmpfile" && 
+        mv -- "$tmpfile" /home/agent/workspace/output.txt
+
+    - description: "Append a log line to an existing file"
+      intent:
+        path: "/home/agent/workspace/run.log"
+        content: "2026-05-18T15:42:01Z run completed\n"
+        mode: append
+      expected_command: |
+        printf '%s' '2026-05-18T15:42:01Z run completed
+        ' >> /home/agent/workspace/run.log
+
+    - description: "Create new file, fail if it exists, with explicit permissions"
+      intent:
+        path: "/home/agent/workspace/secrets/api-token"
+        content: "sk-redacted-example-token"
+        mode: create_new
+        permissions: "0600"
+      expected_command: |
+        ( set -C; printf '%s' 'sk-redacted-example-token' > /home/agent/workspace/secrets/api-token ) && 
+        chmod 0600 -- /home/agent/workspace/secrets/api-token
+
+    - description: "Write with parent directory creation"
+      intent:
+        path: "/home/agent/workspace/build/output/result.json"
+        content: '{"status":"complete"}'
+        create_parents: true
+      expected_command: |
+        mkdir -p -- /home/agent/workspace/build/output && 
+        tmpfile=$(mktemp --tmpdir=/home/agent/workspace/build/output ".result.json.XXXXXX") && 
+        printf '%s' '{"status":"complete"}' > "$tmpfile" && 
+        mv -- "$tmpfile" /home/agent/workspace/build/output/result.json
+
+  anti_patterns:
+    - bad: 'echo "data" > /etc/cron.d/agent-job'
+      reason: "Write to system path enables privilege escalation via cron."
+      rejection: |
+        path canonicalization + FilePath.is_system_path triggers Cedar
+        policy denial. System paths require explicit per-path permission
+        that default policy does not grant.
+
+    - bad: 'echo "$USER_INPUT" > /tmp/script.sh && chmod +x /tmp/script.sh'
+      reason: |
+        Writing executable scripts with agent-controlled content is a common
+        path to RCE. The chmod +x is the giveaway, but writing to predictable
+        paths in /tmp is itself a vulnerability pattern.
+      rejection: |
+        write_file does not couple to chmod execution; the permissions parameter
+        accepts only the file's mode bits, not capability changes. Cedar policy
+        denies writes that grant execute permission to non-policy-permitted
+        paths even when permissions appears in spec.
+
+    - bad: 'echo "data" > "${OUTPUT_PATH}/result.txt"'
+      reason: "Unbounded path composition can write to unintended locations."
+      rejection: |
+        Path is resolved at intent construction. Path components from
+        agent-controlled strings are resolved to literal canonical paths
+        before policy check; OUTPUT_PATH composition happens before LKI
+        sees the intent, not during execution.
+
+    - bad: 'echo "data" >> /var/log/agent.log'
+      reason: |
+        Appending to system log paths can interleave with system logging,
+        produce log injection attacks, or fill disk space affecting other
+        services.
+      rejection: |
+        /var/log requires explicit policy permission for write. Agent logs
+        belong in agent-scoped paths.
+
+    - bad: 'cat huge-input | tee /home/agent/workspace/output.txt'
+      reason: |
+        Pipe-fed content is unbounded from the policy perspective at
+        intent-construction time; no max_size enforcement.
+      rejection: |
+        write_file content parameter has known size at intent construction.
+        Streaming writes are a separate intent (write_file_streaming, future)
+        that declares its size-bound capability differently.
+
+    - bad: 'echo "data" > /home/agent/workspace/symlink-to-elsewhere'
+      reason: |
+        Writing through a symlink can effect changes outside the intended
+        scope; the symlink may point to a system path or another user's
+        directory.
+      rejection: |
+        follow_symlinks default is false. Resolver detects symlink at
+        canonicalization and rejects the write unless explicit policy
+        permits write-through-symlink for this path.
+
+    - bad: 'echo "data" > /home/agent/workspace/file && chmod 777 /home/agent/workspace/file'
+      reason: "World-writable files are an access control problem."
+      rejection: |
+        permissions parameter accepts world-writable modes (777, 666, 0777)
+        only when explicit policy permits. Default policy rejects world-write
+        permissions for write_file.
+
+    - bad: 'echo "" > /home/agent/workspace/important.config'
+      reason: |
+        Writing empty content to an important file effectively destroys it
+        via overwrite. Not technically wrong, but often unintended.
+      rejection: |
+        Not a hard rejection — this is a real use case (truncate file).
+        Resolver-level warning when content is empty and mode is replace;
+        Cedar policy can require confirmation labels for empty-replace on
+        specific paths.

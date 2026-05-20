@@ -1,0 +1,128 @@
+spec:
+  intent: remove_files
+  description: Delete one or more files or directories from the filesystem.
+
+  signature:
+    inputs:
+      - name: paths
+        type: list<FilePath>
+        constraint: "minimum 1; each path absolute or resolved against declared working_dir"
+      - name: recursive
+        type: bool
+        default: false
+        description: |
+          Required true for directory deletion. If any path is a directory and
+          recursive is false, the intent is rejected before execution.
+      - name: force
+        type: bool
+        default: false
+        description: |
+          Suppress errors for nonexistent paths. Does NOT bypass any policy.
+          Granted permissions are evaluated independently.
+    output:
+      type: list<DeletionResult>
+      schema: |
+        DeletionResult {
+          path: FilePath
+          status: enum<deleted, not_found, denied, error>
+          error_message: string?
+        }
+
+  behavior: |
+    Permanently remove the specified files or directories. Deletion is per-path;
+    a denial or error on one path does not prevent processing of others. Returns
+    structured results per path. Symbolic links are unlinked, not followed --
+    deletion never propagates outside the explicit path set.
+
+  constraints:
+    - "Paths must be absolute, or resolve unambiguously against a policy-declared working directory"
+    - "Paths containing shell metacharacters ($, `, ;, |, &, <, >, *, ?, [, newline) are rejected pre-resolution"
+    - "Paths with .. components rejected unless explicit policy permits traversal"
+    - "Paths canonicalized before policy check"
+    - "Symlinks unlinked, not followed; link targets unaffected"
+    - "Cannot delete current working directory or any ancestor of working_dir"
+    - "Deletion is irreversible; no trash/recycle behavior"
+    - "Special filesystems (/proc, /sys, /dev) require explicit per-path permission"
+
+  capability:
+    filesystem:
+      - operation: delete
+        paths: "{paths}"
+        recursive: "{recursive}"
+        follow_symlinks: false
+        canonical: true
+
+  implementation:
+    - tool: rm
+      preferred: true
+      requires: "rm (POSIX)"
+      template: |
+        rm {recursive_flag} {force_flag} -- {paths}
+      notes: |
+        The -- separator prevents path arguments from being interpreted as flags
+        even if a resolved path begins with a hyphen (filesystem can permit this).
+
+  examples:
+    - description: "Delete a single build artifact"
+      intent:
+        paths: ["/tmp/build-output.log"]
+      expected_command: |
+        rm -- /tmp/build-output.log
+
+    - description: "Remove an intermediate build directory recursively"
+      intent:
+        paths: ["./build/intermediate"]
+        recursive: true
+      expected_command: |
+        rm -r -- ./build/intermediate
+
+    - description: "Clean multiple known temp files, tolerate missing"
+      intent:
+        paths: ["/tmp/cache-1", "/tmp/cache-2", "/tmp/cache-3"]
+        force: true
+      expected_command: |
+        rm -f -- /tmp/cache-1 /tmp/cache-2 /tmp/cache-3
+
+    - description: "Remove a directory and its contents with both flags"
+      intent:
+        paths: ["./node_modules"]
+        recursive: true
+        force: true
+      expected_command: |
+        rm -rf -- ./node_modules
+
+  anti_patterns:
+    - bad: 'rm -rf /'
+      reason: "Recursive root deletion."
+      rejection: "Path policy denies root and any system path under every default policy."
+
+    - bad: 'rm -rf $VAR'
+      reason: "Unbounded variable expansion. If $VAR is empty or unset, expands to 'rm -rf', causing undefined behavior."
+      rejection: |
+        Intent declares paths as a typed list, not a string subject to shell expansion.
+        Empty list is rejected at intent construction with explicit error.
+
+    - bad: 'rm -rf "${BUILD_DIR}/output"'
+      reason: "If BUILD_DIR is unset, expands to '/output', which then attempts to delete /output."
+      rejection: |
+        Path resolution happens at intent construction. Tool-SI emits literal resolved
+        paths to the executor; the executor never performs shell variable expansion on
+        path arguments.
+
+    - bad: 'rm /var/log/*.log'
+      reason: "Glob expansion is shell-mediated and invisible to policy."
+      rejection: |
+        Globs expanded at intent construction with the resolved list of paths visible
+        to Cedar policy. The executor receives the literal resolved list, not the glob.
+
+    - bad: 'rm -rf ../../../sensitive-data'
+      reason: "Path traversal."
+      rejection: "Path canonicalization occurs before policy check; canonical path must satisfy policy bounds."
+
+    - bad: 'rm -rf /tmp/$(whoami)'
+      reason: "Command substitution in path argument."
+      rejection: "Command substitution metacharacters ($, `) trigger pre-resolution rejection."
+
+    - bad: 'rm /etc/cron.d/*'
+      reason: "Even with a literal glob in a system directory, this is privilege-relevant deletion."
+      rejection: "System paths (/etc, /usr, /bin, /sbin, /var, /boot, /lib, /lib64) require explicit per-path policy permission."

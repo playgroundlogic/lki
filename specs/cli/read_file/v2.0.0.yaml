@@ -1,0 +1,178 @@
+lki_version: "0.2"
+
+spec:
+  intent: read_file
+  intent_version: "2.0.0"
+  description: Read the contents of a single file from the filesystem.
+
+  signature:
+    inputs:
+      - name: path
+        type: FilePath@1.x
+        constraint: "must be a regular file (not directory, not device, not FIFO, not socket)"
+      - name: encoding
+        type: enum<utf_8, utf_16, latin_1, ascii, bytes>
+        default: utf_8
+        description: |
+          How to interpret the file contents. If 'bytes', returns raw bytes.
+          Otherwise, decodes using the specified encoding and returns a string;
+          decoding failure produces an error rather than partial content.
+      - name: max_size
+        type: Bytes@1.x
+        default: 10MB
+        constraint: "must be <= 1GB"
+        is_resource_bound: true
+        description: |
+          Refuse to read if the file's size exceeds this value. Check happens
+          before any content is read into memory.
+    output:
+      type: union<string, bytes>
+      schema: |
+        # TODO(F-001 carried from v0.1): formalize output type declarations.
+        # Future v2.1.0 may split into read_file (string only) and
+        # read_file_bytes (bytes only) per F-017 disposition; v2.0.0 preserves
+        # v0.1's union contract.
+        # When encoding is 'bytes': returns raw bytes
+        # Otherwise: returns decoded string
+
+  behavior: |
+    Open the file at path, verify size is within max_size, read contents
+    fully into memory, decode per encoding (if not bytes), and return.
+    Does not read partial files; if the file exceeds max_size, the intent
+    fails with a structured error before any read occurs. Does not follow
+    symbolic links unless explicit policy permits.
+
+    Behavioral guarantees (normative for the contract):
+      - File is read fully into memory; max_size bounds memory consumption
+      - Encoding decoding is atomic at the result level: either the full
+        decode succeeds or the intent fails (no partial decode)
+      - Reading from FIFOs, sockets, or devices is rejected (use streaming
+        intents instead for those cases)
+
+  constraints:
+    parameter_constraints: []
+    cross_parameter_constraints: []
+
+  capability:
+    filesystem:
+      - operation: read
+        paths: ["{path}"]
+        recursive: false
+        follow_symlinks: false
+        canonical: true
+        purpose: user_facing
+
+  resolver_constraints:
+    file_type_validation:
+      - parameter: path
+        rule: "stat(path).type must be S_IFREG (regular file)"
+        reason: |
+          Pre-read stat() rejects directories, FIFOs, sockets, devices,
+          and other non-regular file types. Reading these has undefined
+          or unbounded semantics; LKI requires bounded operations.
+    file_size_check:
+      - parameter: path
+        rule: "stat(path).size must be <= max_size"
+        reason: |
+          File size verified before any content is read. Files exceeding
+          max_size produce an error rather than partial reads or
+          truncation.
+
+  internal_behaviors:
+    cache_lookup:
+      - description: "Kernel page cache may serve recently-read content from memory"
+        controllable_via_parameter: false
+        policy_relevance: "Page cache content is per-process-visible; cache state is not a policy concern"
+
+  implementation:
+    - tool: cat
+      priority: 100
+      requires: "cat (POSIX)"
+      tested_against: ["coreutils 8.x", "coreutils 9.x", "BSD cat"]
+      template: |
+        cat -- {path}
+      notes: |
+        cat is used purely for byte retrieval; resolver applies encoding
+        decoding to the output (per Chapter 11 pipeline). Pre-read stat()
+        and size check happen in resolver_constraints stage before cat is
+        invoked.
+
+  examples:
+    - description: "Read a UTF-8 source file"
+      intent:
+        path: "/home/agent/workspace/lki/specs/cli/fetch_url.yaml"
+      expected_command: |
+        cat -- /home/agent/workspace/lki/specs/cli/fetch_url.yaml
+
+    - description: "Read a binary file as raw bytes"
+      intent:
+        path: "/home/agent/workspace/cache/image.png"
+        encoding: bytes
+      expected_command: |
+        cat -- /home/agent/workspace/cache/image.png
+
+    - description: "Read with explicit size limit for a known-large file"
+      intent:
+        path: "/home/agent/workspace/data/dataset.csv"
+        max_size: 500MB
+      expected_command: |
+        cat -- /home/agent/workspace/data/dataset.csv
+
+  anti_patterns:
+    - bad: 'cat /etc/shadow'
+      reason: "Reads sensitive system file with credentials."
+      rejection: |
+        path canonicalization combined with FilePath.is_system_path = true
+        triggers Cedar safety floor policy denial. /etc is included in the
+        system_path tree set.
+
+    - bad: 'cat /proc/self/environ'
+      reason: |
+        Reading process environment via pseudo-filesystem can leak credentials
+        or secrets passed as environment variables.
+      rejection: |
+        Pseudo-filesystem paths (/proc, /sys, /dev) require explicit per-path
+        permission. NOTE: v0.2 FilePath@1.x type does not include an
+        is_pseudo_filesystem observed attribute (recorded as F-038 in
+        FINDINGS_v0.2.md). For v2.0.0, this rejection is documented but the
+        Cedar projection cannot directly express it via a derived attribute;
+        tenant policy templates must hand-write the policy referencing
+        specific path prefixes.
+
+    - bad: 'cat /var/log/auth.log'
+      reason: |
+        System log files contain authentication events and other sensitive
+        operational data that agents typically should not access.
+      rejection: |
+        path canonicalization combined with FilePath.is_system_path = true
+        (covering /var/log via the /var tree) triggers Cedar safety floor
+        policy denial.
+
+    - bad: 'cat /dev/urandom'
+      reason: |
+        Reading from devices is unbounded; LKI requires bounded operations
+        and treats infinite streams as policy-confusing.
+      rejection: |
+        Pre-read stat() check in resolver_constraints rejects non-regular
+        file types (S_IFREG required). /dev/urandom is a character device
+        (S_IFCHR), rejected before cat is invoked. Use a dedicated
+        random_bytes intent if randomness is needed.
+
+    - bad: 'cat /home/other-user/.ssh/id_rsa'
+      reason: |
+        Reading another user's home directory crosses isolation boundaries
+        even within a single host.
+      rejection: |
+        path canonicalization combined with !FilePath.is_within_working_dir
+        triggers Cedar policy denial. Other-user home directories are not
+        within the principal's declared working_dir.
+
+    - bad: 'cat my-fifo'
+      reason: |
+        FIFO reads can block indefinitely or produce content that wasn't
+        in the named-pipe at evaluation time.
+      rejection: |
+        Pre-read stat() check rejects non-regular-file paths. FIFO
+        (S_IFIFO), socket (S_IFSOCK), device (S_IFCHR, S_IFBLK), and
+        directory (S_IFDIR) types all fail file_type_validation in
+        resolver_constraints before cat is invoked.

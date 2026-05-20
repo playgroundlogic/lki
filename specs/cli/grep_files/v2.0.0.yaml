@@ -1,0 +1,335 @@
+lki_version: "0.2"
+
+spec:
+  intent: grep_files
+  intent_version: "2.0.0"
+  description: Search file contents for a pattern, returning matching lines with location and optional context.
+
+  types:
+    Match:
+      type_version: "1.0.0"
+      structural_attributes:
+        path:
+          type: FilePath@1.x
+          description: "Canonical path of the file containing the match"
+        line_number:
+          type: int
+          description: "1-indexed line number within the file"
+        line:
+          type: string
+          description: "Full content of the matching line"
+        context_before:
+          type: list<string>
+          description: "Lines immediately before the match (up to context_lines)"
+        context_after:
+          type: list<string>
+          description: "Lines immediately after the match (up to context_lines)"
+
+  signature:
+    inputs:
+      - name: pattern
+        type: Regex@1.x
+        constraint: "grammar determined by pattern_type; length <= 1024 chars"
+      - name: paths
+        type: list<FilePath@1.x>
+        constraint: "minimum 1; each path must be readable and within policy scope"
+      - name: pattern_type
+        type: enum<fixed, basic_posix, extended_posix, perl>
+        default: extended_posix
+        description: |
+          fixed = literal string match, no metacharacters
+          basic_posix = POSIX BRE (grep default grammar)
+          extended_posix = POSIX ERE (grep -E grammar)
+          perl = PCRE; bounded subset (no nested quantifiers, no recursion)
+      - name: case_insensitive
+        type: bool
+        default: false
+      - name: recursive
+        type: bool
+        default: false
+        description: "If true, directories in paths are descended"
+      - name: include_glob
+        type: string
+        optional: true
+        constraint: "length <= 256 chars"
+        description: "Filename glob restricting which files are searched (recursive mode)"
+      - name: exclude_glob
+        type: string
+        optional: true
+        constraint: "length <= 256 chars"
+      - name: max_count
+        type: int
+        optional: true
+        constraint: "if set, must be > 0"
+        is_resource_bound: true
+        description: "Stop after this many matches per file"
+      - name: context_lines
+        type: int
+        default: 0
+        constraint: "must be 0..10"
+        is_resource_bound: true
+    output:
+      type: list<Match>
+      streaming: bounded
+
+  behavior: |
+    Search the contents of files at paths for lines matching pattern. Returns
+    structured matches with location metadata. Never modifies files.
+
+    Behavioral guarantees (normative for the contract):
+      - Pattern grammar is explicit per pattern_type; complexity is bounded
+        at the resolver layer to prevent catastrophic backtracking
+      - Binary files skipped by default
+      - Entry order within results is implementation-defined; consumers
+        must not rely on ordering across implementations
+      - Symbolic links not followed unless explicit policy permits
+
+  constraints:
+    parameter_constraints: []
+    cross_parameter_constraints:
+      - description: "include_glob and exclude_glob require recursive mode"
+        rule: "(include_glob is not null or exclude_glob is not null) implies recursive == true"
+
+  capability:
+    filesystem:
+      - operation: read
+        paths: ["{paths}"]
+        recursive: "{recursive}"
+        follow_symlinks: false
+        canonical: true
+        purpose: user_facing
+        recursion_safety:
+          cycle_prevention: required
+          max_depth: 50
+          visited_set: by_canonical_path
+
+  resolver_constraints:
+    pattern_complexity:
+      - parameter: pattern
+        rule: "when pattern_type is perl, no nested quantifiers and no recursive subpatterns"
+        reason: "ReDoS prevention; PCRE catastrophic backtracking under adversarial input"
+      - parameter: pattern
+        rule: "pattern length <= 1024 characters"
+        reason: "Bounded parsing time"
+    glob_validation:
+      - parameter: include_glob
+        rule: "must be a valid glob pattern with no shell metacharacters beyond [, ], *, ?"
+        reason: "Prevent shell injection via glob string"
+      - parameter: exclude_glob
+        rule: "must be a valid glob pattern with no shell metacharacters beyond [, ], *, ?"
+        reason: "Prevent shell injection via glob string"
+
+  internal_behaviors:
+    binary_file_skipping:
+      - description: "Files detected as binary (containing null bytes in first 8KB) are skipped"
+        controllable_via_parameter: false
+        policy_relevance: "Skip is silent; audit log records files searched, not files skipped"
+
+  implementation:
+    - tool: ripgrep
+      priority: 100
+      requires: "rg >= 13.0"
+      tested_against: ["rg 13.x", "rg 14.x"]
+      template: |
+        rg {pattern_type_flag} {case_flag} {recursive_flag}
+           {include_flag} {exclude_flag} {max_count_flag} {context_flag}
+           --json
+           {pattern|shell_quoted} {paths[ ]}
+      parameter_mapping:
+        pattern_type_flag:
+          cases:
+            - when: "pattern_type == fixed"
+              value: "--fixed-strings"
+            - when: "pattern_type == basic_posix"
+              value: "--regexp-style=basic"
+            - when: "pattern_type == extended_posix"
+              value: ""
+            - when: "pattern_type == perl"
+              value: "--pcre2"
+        case_flag:
+          cases:
+            - when: "case_insensitive == true"
+              value: "--ignore-case"
+            - default:
+              value: ""
+        recursive_flag:
+          cases:
+            - when: "recursive == true"
+              value: ""
+            - default:
+              value: "--no-recurse"
+        include_flag:
+          cases:
+            - when: "include_glob is not null"
+              value: "--glob {include_glob|shell_quoted}"
+            - default:
+              value: ""
+        exclude_flag:
+          cases:
+            - when: "exclude_glob is not null"
+              value: "--glob !{exclude_glob|shell_quoted}"
+            - default:
+              value: ""
+        max_count_flag:
+          cases:
+            - when: "max_count is not null"
+              value: "--max-count {max_count}"
+            - default:
+              value: ""
+        context_flag:
+          cases:
+            - when: "context_lines > 0"
+              value: "--context {context_lines}"
+            - default:
+              value: ""
+      notes: |
+        JSON output (--json) maps directly to Match schema; structured
+        parsing not required at resolver layer beyond JSON decoding.
+
+    - tool: grep
+      priority: 50
+      requires: "grep >= 3.0 (GNU) or POSIX grep"
+      tested_against: ["GNU grep 3.x", "BSD grep"]
+      limitations:
+        - "Perl mode (--perl-regexp) only available on GNU grep, not POSIX"
+        - "Glob filtering requires --include= rather than ripgrep's --glob"
+        - "Output is line-oriented; resolver parses path:line:content format"
+      template: |
+        grep {pattern_type_flag} {case_flag} {recursive_flag}
+             {include_flag} {exclude_flag} {max_count_flag} {context_flag}
+             --line-number --with-filename
+             {pattern|shell_quoted} {paths[ ]}
+      parameter_mapping:
+        pattern_type_flag:
+          cases:
+            - when: "pattern_type == fixed"
+              value: "--fixed-strings"
+            - when: "pattern_type == basic_posix"
+              value: "--basic-regexp"
+            - when: "pattern_type == extended_posix"
+              value: "--extended-regexp"
+            - when: "pattern_type == perl"
+              value: "--perl-regexp"
+        case_flag:
+          cases:
+            - when: "case_insensitive == true"
+              value: "--ignore-case"
+            - default:
+              value: ""
+        recursive_flag:
+          cases:
+            - when: "recursive == true"
+              value: "--recursive"
+            - default:
+              value: ""
+        include_flag:
+          cases:
+            - when: "include_glob is not null"
+              value: "--include={include_glob|shell_quoted}"
+            - default:
+              value: ""
+        exclude_flag:
+          cases:
+            - when: "exclude_glob is not null"
+              value: "--exclude={exclude_glob|shell_quoted}"
+            - default:
+              value: ""
+        max_count_flag:
+          cases:
+            - when: "max_count is not null"
+              value: "--max-count={max_count}"
+            - default:
+              value: ""
+        context_flag:
+          cases:
+            - when: "context_lines > 0"
+              value: "--context={context_lines}"
+            - default:
+              value: ""
+
+  examples:
+    - description: "Find TODO comments in Go source"
+      intent:
+        pattern: "TODO|FIXME|XXX"
+        paths: ["./src"]
+        pattern_type: extended_posix
+        recursive: true
+        include_glob: "*.go"
+      expected_command: |
+        rg  --ignore-case --no-recurse
+           --glob '*.go'
+           --json
+           'TODO|FIXME|XXX' ./src
+
+    - description: "Case-insensitive literal search for a function name"
+      intent:
+        pattern: "fnInitialize"
+        paths: ["./internal/auth.go"]
+        pattern_type: fixed
+        case_insensitive: true
+      expected_command: |
+        rg --fixed-strings --ignore-case --no-recurse
+           --json
+           fnInitialize ./internal/auth.go
+
+    - description: "Search recent error returns with context"
+      intent:
+        pattern: "return.*err"
+        paths: ["./pkg"]
+        pattern_type: extended_posix
+        recursive: true
+        context_lines: 2
+        include_glob: "*.go"
+      expected_command: |
+        rg   --context 2
+           --glob '*.go'
+           --json
+           'return.*err' ./pkg
+
+    - description: "Bounded scan, stop after first match per file"
+      intent:
+        pattern: "package main"
+        paths: ["./cmd"]
+        pattern_type: fixed
+        recursive: true
+        max_count: 1
+      expected_command: |
+        rg --fixed-strings   --max-count 1
+           --json
+           'package main' ./cmd
+
+  anti_patterns:
+    - bad: 'grep ".*" /etc/shadow'
+      reason: "Reads sensitive system file outside any agent's legitimate scope."
+      rejection: |
+        path canonicalization combined with FilePath.is_system_path = true
+        (covering /etc tree) triggers Cedar safety floor policy denial.
+
+    - bad: 'grep -P "^(a+)+$" inputs/'
+      reason: "Nested quantifier in PCRE mode is the canonical ReDoS construct."
+      rejection: |
+        resolver_constraints.pattern_complexity rejects nested quantifiers
+        when pattern_type is perl. Check happens before any file is read.
+
+    - bad: 'grep -rl secret / 2>/dev/null'
+      reason: "Recursive search from filesystem root probing for credentials."
+      rejection: |
+        Root and ancestor paths satisfy !FilePath.is_within_working_dir,
+        triggering Cedar policy denial.
+
+    - bad: 'grep "${USER_PATTERN}" data.txt'
+      reason: "Pattern from agent-controlled string can include ReDoS constructs or shell metacharacters."
+      rejection: |
+        pattern is a typed Regex@1.x parameter with declared grammar.
+        Pattern validation against the grammar happens at parameter
+        parsing stage; ReDoS constructs in perl mode are rejected by
+        resolver_constraints.pattern_complexity before any file read.
+
+    - bad: 'grep -r pattern /sys'
+      reason: "Recursive search of /sys, /proc, /dev produces pseudo-filesystem traversal with unbounded cost."
+      rejection: |
+        Pseudo-filesystem paths require explicit per-path policy permission.
+        NOTE: v0.2 FilePath@1.x type does not include an is_pseudo_filesystem
+        observed attribute (F-038 in FINDINGS_v0.2.md); for v2.0.0 this
+        rejection requires hand-written tenant policy referencing /sys, /proc,
+        /dev path prefixes specifically.

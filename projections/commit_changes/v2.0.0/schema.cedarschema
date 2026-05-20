@@ -1,0 +1,152 @@
+// Cedar schema generated from LKI spec: commit_changes@2.0.0
+// LKI format version: 0.2
+//
+// CHANGES FROM v1.0.0 PROJECTION:
+//   - GitRepository entity now declares structural vs observed attributes
+//     explicitly (per F-030 disposition)
+//   - StateMutation::Write::Git action context includes three-axis attributes
+//     (visibility, durability, reversibility) per F-025 disposition
+//   - Tool entity declarations show 'git' instance with v0.2 registry pattern
+//   - Action::"Filesystem::Read" added; not present in v1.0.0 projection
+//   - Context attributes include 'purpose' uniformly per F-027
+
+namespace Lki {
+
+  // ==========================================================================
+  // Shared entity types (declared inline for self-contained reading)
+  // ==========================================================================
+
+  entity Principal = {
+    "id": String,
+    "labels": Set<String>,
+    "working_dir": String,
+    "session_id": String,
+  };
+
+  entity FilePath = {
+    // structural
+    "canonical": String,
+    "is_absolute": Bool,
+    "extension": String,
+    // observed
+    "is_system_path": Bool,
+    "is_within_working_dir": Bool,
+    "exists": Bool,
+    "is_writable_by_policy": Bool,
+  };
+
+  // ==========================================================================
+  // GitRepository entity (from types/v0.2/entities/GitRepository.lki.yaml)
+  // ==========================================================================
+  //
+  // Structural attributes are stable for the entity's identity.
+  // Observed attributes are populated at request construction time from
+  // the actual repository state. Policies over observed attributes have
+  // TOCTOU implications (observation at construction; execution later).
+
+  entity GitRepository = {
+    // structural
+    "canonical_path": String,
+
+    // observed (populated at request construction)
+    "working_dir_rooted": Bool,
+    "current_branch": String,
+    "has_uncommitted_changes": Bool,
+    "is_detached_head": Bool,
+    "has_in_progress_operation": Bool,
+    "remote_count": Long,
+  };
+
+  // ==========================================================================
+  // Tool entity (instances from registries/tools/v0.2/tools.lki.yaml)
+  // ==========================================================================
+
+  entity Tool = {
+    // structural
+    "name": String,
+    "is_system_critical": Bool,
+    // observed
+    "version_available": String,
+  };
+
+  // Known Tool instances (declared via Cedar entity data, not schema):
+  //   Lki::Tool::"git"       — name: "git",       is_system_critical: false
+  //   Lki::Tool::"curl"      — name: "curl",      is_system_critical: false
+  //   Lki::Tool::"systemctl" — name: "systemctl", is_system_critical: true
+  //   ... (full registry is the canonical source)
+
+  // ==========================================================================
+  // Action: Filesystem::Read
+  // ==========================================================================
+
+  action "Filesystem::Read" appliesTo {
+    principal: [Principal],
+    resource: [FilePath],
+    context: {
+      "intent_name": String,
+      "intent_version": String,
+      "purpose": String,
+      "recursive": Bool,
+      "follow_symlinks": Bool,
+    }
+  };
+
+  // ==========================================================================
+  // Action: Filesystem::Write
+  // ==========================================================================
+
+  action "Filesystem::Write" appliesTo {
+    principal: [Principal],
+    resource: [FilePath],
+    context: {
+      "intent_name": String,
+      "intent_version": String,
+      "purpose": String,
+      "recursive": Bool,
+      "follow_symlinks": Bool,
+    }
+  };
+
+  // ==========================================================================
+  // Action: StateMutation::Write::Git
+  // ==========================================================================
+  //
+  // The :Git specifier exists because policies frequently want to
+  // distinguish git mutations from email, database, etc. (Chapter 9.3).
+  // Resource is GitRepository (the entity being mutated).
+  // Context carries the three-axis state semantics (Chapter 7.5.1).
+
+  action "StateMutation::Write::Git" appliesTo {
+    principal: [Principal],
+    resource: [GitRepository],
+    context: {
+      "intent_name": String,
+      "intent_version": String,
+      "purpose": String,
+      "operation": String,              // "commit", "merge", "rebase", "reset", "push"
+      "visibility": String,             // "immediate" | "rename_atomic" | "transactional"
+      "durability": String,             // "in_memory" | "committed" | "fsynced" | "fsynced_with_dir"
+      "reversibility": String,          // "irreversible" | "reversible_locally" | "reversible_until_remote_sync" | "undo_via_compensating_action"
+      // Specific to git commits:
+      "message_subject_length": Long,
+      "files_affected_count": Long,
+    }
+  };
+
+  // ==========================================================================
+  // Action: Process::Spawn
+  // ==========================================================================
+
+  action "Process::Spawn" appliesTo {
+    principal: [Principal],
+    resource: [Tool],
+    context: {
+      "intent_name": String,
+      "intent_version": String,
+      "purpose": String,
+      "uid_required": String,           // "current" | "root" | "declared"
+      "arg_count": Long,
+    }
+  };
+
+}

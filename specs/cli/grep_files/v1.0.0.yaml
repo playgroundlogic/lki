@@ -1,0 +1,170 @@
+spec:
+  intent: grep_files
+  description: Search file contents for a pattern, returning matching lines with location and optional context.
+
+  signature:
+    inputs:
+      - name: pattern
+        type: Regex
+        constraint: "grammar determined by pattern_type; length <= 1024 chars"
+      - name: paths
+        type: list<FilePath>
+        constraint: "minimum 1; each path must be readable and within policy scope"
+      - name: pattern_type
+        type: enum<fixed, basic_posix, extended_posix, perl>
+        default: extended_posix
+        description: |
+          fixed = literal string match, no metacharacters
+          basic_posix = POSIX BRE (grep default grammar)
+          extended_posix = POSIX ERE (grep -E grammar)
+          perl = PCRE; bounded subset (no nested quantifiers, no recursion)
+      - name: case_insensitive
+        type: bool
+        default: false
+      - name: recursive
+        type: bool
+        default: false
+        description: "If true, directories in paths are descended; if false, directories cause rejection"
+      - name: include_glob
+        type: string
+        optional: true
+        description: "Filename glob restricting which files are searched (recursive mode)"
+      - name: exclude_glob
+        type: string
+        optional: true
+      - name: max_count
+        type: int
+        optional: true
+        constraint: "if set, must be > 0"
+        description: "Stop after this many matches per file"
+      - name: context_lines
+        type: int
+        default: 0
+        constraint: "must be 0..10"
+    output:
+      type: list<Match>
+      schema: |
+        Match {
+          path: FilePath
+          line_number: int
+          line: string
+          context_before: list<string>
+          context_after: list<string>
+        }
+
+  behavior: |
+    Search the contents of files at paths for lines matching pattern. Returns
+    structured matches with location metadata. Never modifies files. Pattern
+    grammar is explicit per pattern_type; complexity is bounded to avoid
+    catastrophic backtracking on adversarial input.
+
+  constraints:
+    - "Pattern length <= 1024 characters"
+    - "Perl mode rejects nested quantifiers and recursive subpatterns (ReDoS prevention)"
+    - "Binary files skipped by default"
+    - "Symbolic links not followed unless explicitly permitted by policy"
+    - "Paths canonicalized before policy check; .. traversal rejected unless permitted"
+
+  capability:
+    filesystem:
+      - operation: read
+        paths: "{paths}"
+        recursive: "{recursive}"
+        follow_symlinks: false
+    compute:
+      - bounded_regex: true
+        max_pattern_complexity: "no_nested_quantifiers, no_recursion, no_lookahead_when_perl"
+
+  implementation:
+    - tool: ripgrep
+      preferred: true
+      requires: "rg >= 13.0"
+      template: |
+        rg {pattern_type_flag} {case_flag} {recursive_flag}
+           {include_flag} {exclude_flag} {max_count_flag} {context_flag}
+           --json
+           {pattern} {paths}
+      notes: "JSON output maps directly to Match schema; structured parsing not required."
+    - tool: grep
+      requires: "grep >= 3.0 (GNU) or POSIX grep"
+      template: |
+        grep {pattern_type_flag} {case_flag} {recursive_flag}
+             {include_flag} {exclude_flag} {max_count_flag} {context_flag}
+             --line-number --with-filename
+             {pattern} {paths}
+      notes: "Line-oriented output; resolver parses path:line:content format."
+      limitations:
+        - "Perl mode (--perl-regexp) only available on GNU grep, not POSIX"
+        - "Glob filtering requires --include= rather than ripgrep's --type"
+
+  examples:
+    - description: "Find TODO comments in Go source"
+      intent:
+        pattern: "TODO|FIXME|XXX"
+        paths: ["./src"]
+        pattern_type: extended_posix
+        recursive: true
+        include_glob: "*.go"
+      expected_command: |
+        rg --extended-regexp --line-number
+           --glob '*.go'
+           --json
+           'TODO|FIXME|XXX' ./src
+
+    - description: "Case-insensitive literal search for a function name"
+      intent:
+        pattern: "fnInitialize"
+        paths: ["./internal/auth.go"]
+        pattern_type: fixed
+        case_insensitive: true
+      expected_command: |
+        rg --fixed-strings --ignore-case --line-number
+           --json
+           fnInitialize ./internal/auth.go
+
+    - description: "Search recent error returns with context"
+      intent:
+        pattern: "return.*err"
+        paths: ["./pkg"]
+        pattern_type: extended_posix
+        recursive: true
+        context_lines: 2
+        include_glob: "*.go"
+      expected_command: |
+        rg --extended-regexp --line-number --context 2
+           --glob '*.go'
+           --json
+           'return.*err' ./pkg
+
+    - description: "Bounded scan, stop after first match per file"
+      intent:
+        pattern: "package main"
+        paths: ["./cmd"]
+        pattern_type: fixed
+        recursive: true
+        max_count: 1
+      expected_command: |
+        rg --fixed-strings --line-number --max-count 1
+           --json
+           'package main' ./cmd
+
+  anti_patterns:
+    - bad: 'grep ".*" /etc/shadow'
+      reason: "Reads sensitive system file outside any agent's legitimate scope."
+      rejection: "Path policy denies reads outside permitted directories; grep_files cannot bypass."
+
+    - bad: 'grep -P "^(a+)+$" inputs/'
+      reason: "Nested quantifier in PCRE mode is the canonical ReDoS construct."
+      rejection: "Pattern complexity check in perl mode rejects nested quantifiers before execution."
+
+    - bad: 'grep -rl secret / 2>/dev/null'
+      reason: "Recursive search from filesystem root probing for credentials."
+      rejection: "Root and ancestor paths require explicit policy permission; default policy denies."
+
+    - bad: 'grep "${USER_PATTERN}" data.txt'
+      reason: "Pattern from agent-controlled string can include ReDoS constructs or shell metacharacters."
+      rejection: "Pattern must be resolved at intent construction; passed as typed Regex with grammar validation."
+
+    - bad: 'grep -r pattern /sys'
+      reason: "Recursive search of /sys, /proc, /dev produces pseudo-filesystem traversal with unbounded cost."
+      rejection: "Pseudo-filesystems require explicit per-path permission; default policy denies."

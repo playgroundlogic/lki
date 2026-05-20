@@ -1,0 +1,294 @@
+# Runtime PDP query shape for commit_changes@2.0.0
+# LKI format version: 0.2
+#
+# CHANGES FROM v1.0.0 PROJECTION:
+#   - Three-axis state_mutation context attributes (visibility, durability,
+#     reversibility) populated per the spec's declarations
+#   - Capability purpose annotations in all PDP contexts
+#   - Observed_state section formalized per Chapter 10.5
+#   - Five PDP queries (was 5 in v1.0.0 too — expansion rule unchanged
+#     for this spec since filesystem.read with 2 paths expands to 2 queries)
+
+# ============================================================================
+# Scenario: Agent commits a single file change to the LKI repo
+# ============================================================================
+
+intent:
+  name: commit_changes
+  version: "2.0.0"
+  parameters:
+    repository_path: "/home/agent/workspace/lki"
+    message: "Add write_file v2.0.0 migration"
+    paths: ["specs/cli/write_file/v2.0.0.yaml"]
+
+principal:
+  id: "agent-session-abc123"
+  labels: ["developer"]
+  working_dir: "/home/agent/workspace"
+  session_id: "sess-2026-05-19-002"
+
+# ============================================================================
+# Request-time state observation (Chapter 10.5)
+# ============================================================================
+#
+# Observed at construction time, before any PDP query. The structural
+# attributes are derived from the spec's type declarations; the observed
+# attributes come from inspecting the actual environment.
+
+observed_state:
+  "GitRepository:/home/agent/workspace/lki":
+    canonical_path: "/home/agent/workspace/lki"
+    working_dir_rooted: true              # observed: within principal.working_dir
+    current_branch: "main"
+    has_uncommitted_changes: true
+    is_detached_head: false
+    has_in_progress_operation: false
+    remote_count: 1
+
+  "FilePath:/home/agent/workspace/lki/.git":
+    canonical: "/home/agent/workspace/lki/.git"
+    is_within_working_dir: true
+    is_system_path: false
+
+  "FilePath:/home/agent/workspace/lki":
+    canonical: "/home/agent/workspace/lki"
+    is_within_working_dir: true
+    is_system_path: false
+
+  "Tool:git":
+    name: "git"
+    is_system_critical: false
+    version_available: "2.42.0"
+
+# ============================================================================
+# Resolver pipeline: capability expansion (Stage 5)
+# ============================================================================
+#
+# commit_changes has 4 capability declarations but expansion produces 5
+# resolved instances (F-029: list-valued paths expand to one per path).
+
+resolved_capabilities:
+  - source: "filesystem[0]"             # filesystem.read with two paths expands to 2
+    purpose: implementation_detail
+    instances:
+      - operation: read
+        path: FilePath:"/home/agent/workspace/lki/.git"
+        recursive: true
+        follow_symlinks: false
+      - operation: read
+        path: FilePath:"/home/agent/workspace/lki"
+        recursive: true
+        follow_symlinks: false
+
+  - source: "filesystem[1]"             # filesystem.write
+    purpose: implementation_detail
+    instances:
+      - operation: write
+        path: FilePath:"/home/agent/workspace/lki/.git"
+        recursive: true
+        follow_symlinks: false
+
+  - source: "state_mutation[0]"
+    purpose: user_facing
+    instances:
+      - operation: commit
+        resource: GitRepository:"/home/agent/workspace/lki"
+        visibility: immediate
+        durability: committed
+        reversibility: reversible_until_remote_sync
+
+  - source: "process[0]"
+    purpose: implementation_detail
+    instances:
+      - operation: spawn
+        target: Tool:"git"
+        uid_required: current
+
+# Total: 5 PDP queries (2 from filesystem[0], 1 each from filesystem[1],
+# state_mutation[0], process[0]).
+
+# ============================================================================
+# PDP queries
+# ============================================================================
+
+pdp_request_1:
+  capability_source: "filesystem[0] (1 of 2)"
+  principal: Lki::Principal::"agent-session-abc123"
+  action: Lki::Action::"Filesystem::Read"
+  resource: Lki::FilePath::"/home/agent/workspace/lki/.git"
+  context:
+    intent_name: "commit_changes"
+    intent_version: "2.0.0"
+    purpose: "implementation_detail"
+    recursive: true
+    follow_symlinks: false
+  expected_decision: Allow
+  matching_policies: ["baseline-fs-read-implementation-detail-within-working-dir"]
+
+pdp_request_2:
+  capability_source: "filesystem[0] (2 of 2)"
+  principal: Lki::Principal::"agent-session-abc123"
+  action: Lki::Action::"Filesystem::Read"
+  resource: Lki::FilePath::"/home/agent/workspace/lki"
+  context:
+    intent_name: "commit_changes"
+    intent_version: "2.0.0"
+    purpose: "implementation_detail"
+    recursive: true
+    follow_symlinks: false
+  expected_decision: Allow
+  matching_policies: ["baseline-fs-read-implementation-detail-within-working-dir"]
+
+pdp_request_3:
+  capability_source: "filesystem[1]"
+  principal: Lki::Principal::"agent-session-abc123"
+  action: Lki::Action::"Filesystem::Write"
+  resource: Lki::FilePath::"/home/agent/workspace/lki/.git"
+  context:
+    intent_name: "commit_changes"
+    intent_version: "2.0.0"
+    purpose: "implementation_detail"
+    recursive: true
+    follow_symlinks: false
+  expected_decision: Allow
+  matching_policies: ["baseline-fs-write-implementation-detail-within-working-dir"]
+
+pdp_request_4:
+  capability_source: "state_mutation[0]"
+  principal: Lki::Principal::"agent-session-abc123"
+  action: Lki::Action::"StateMutation::Write::Git"
+  resource: Lki::GitRepository::"/home/agent/workspace/lki"
+  context:
+    intent_name: "commit_changes"
+    intent_version: "2.0.0"
+    purpose: "user_facing"
+    operation: "commit"
+    visibility: "immediate"
+    durability: "committed"
+    reversibility: "reversible_until_remote_sync"
+    message_subject_length: 35
+    files_affected_count: 1
+  expected_decision: Allow
+  matching_policies: ["baseline-git-commit-in-working-dir"]
+  policies_NOT_matching:
+    - "safety-floor-not-working-dir-rooted"     # working_dir_rooted is true
+    - "safety-floor-detached-head"               # is_detached_head is false
+    - "safety-floor-in-progress-operation"       # has_in_progress_operation is false
+
+pdp_request_5:
+  capability_source: "process[0]"
+  principal: Lki::Principal::"agent-session-abc123"
+  action: Lki::Action::"Process::Spawn"
+  resource: Lki::Tool::"git"
+  context:
+    intent_name: "commit_changes"
+    intent_version: "2.0.0"
+    purpose: "implementation_detail"
+    uid_required: "current"
+    arg_count: 5     # git, commit, --message, "...", (working_directory handled separately)
+  expected_decision: Allow
+  matching_policies: ["baseline-spawn-git-for-commit-changes"]
+
+# ============================================================================
+# Intent-level atomicity (F-006)
+# ============================================================================
+
+intent_decision:
+  outcome: Allow
+  pdp_query_count: 5
+  all_allowed: true
+  resolver_proceeds: true
+
+# ============================================================================
+# Counter-example: commit on detached HEAD
+# ============================================================================
+
+counter_example:
+  scenario: "Agent attempts commit_changes while HEAD is detached"
+
+  observed_state:
+    "GitRepository:/home/agent/workspace/lki":
+      is_detached_head: true            # observed state changed
+      # ... other attributes unchanged
+
+  pdp_request_4_decision: Deny
+  determining_policy: "safety-floor-detached-head"
+
+  intent_outcome: Deny
+  partial_state: none                   # no commit attempted; git not spawned
+  audit_log_records_all_queries: true
+  error_returned_to_caller: |
+    {
+      "intent": "commit_changes@2.0.0",
+      "decision": "Deny",
+      "denied_capability": "state_mutation[0]",
+      "denied_resource": "GitRepository:/home/agent/workspace/lki",
+      "determining_policy": "safety-floor-detached-head",
+      "policy_reason": "commits on detached HEAD are typically lost when HEAD moves; require explicit branch checkout first"
+    }
+
+# ============================================================================
+# Audit entry (Chapter 10 schema)
+# ============================================================================
+
+audit_entry:
+  entry_id: "sha256:8f2a3b4c..."
+  schema_version: "0.2"
+  timestamp: "2026-05-19T15:42:33.117Z"
+
+  principal:
+    id: "agent-session-abc123"
+    session_id: "sess-2026-05-19-002"
+    labels: ["developer"]
+
+  intent:
+    name: "commit_changes"
+    version: "2.0.0"
+
+  intent_parameters:
+    repository_path: "/home/agent/workspace/lki"
+    message: "Add write_file v2.0.0 migration"
+    paths: ["specs/cli/write_file/v2.0.0.yaml"]
+
+  resource_bounds: {}                   # commit_changes has no resource-bound parameters
+
+  observed_state:
+    "GitRepository:/home/agent/workspace/lki":
+      working_dir_rooted: true
+      current_branch: "main"
+      is_detached_head: false
+      has_in_progress_operation: false
+
+  resolved_capabilities:
+    - "Filesystem::Read on /home/agent/workspace/lki/.git (implementation_detail)"
+    - "Filesystem::Read on /home/agent/workspace/lki (implementation_detail)"
+    - "Filesystem::Write on /home/agent/workspace/lki/.git (implementation_detail)"
+    - "StateMutation::Write::Git on /home/agent/workspace/lki (commit, immediate/committed/reversible_until_remote_sync, user_facing)"
+    - "Process::Spawn on Tool::git (uid current, implementation_detail)"
+
+  pdp_decisions:
+    - request: 1
+      decision: "Allow"
+      determining_policies: ["baseline-fs-read-implementation-detail-within-working-dir"]
+    - request: 2
+      decision: "Allow"
+      determining_policies: ["baseline-fs-read-implementation-detail-within-working-dir"]
+    - request: 3
+      decision: "Allow"
+      determining_policies: ["baseline-fs-write-implementation-detail-within-working-dir"]
+    - request: 4
+      decision: "Allow"
+      determining_policies: ["baseline-git-commit-in-working-dir"]
+    - request: 5
+      decision: "Allow"
+      determining_policies: ["baseline-spawn-git-for-commit-changes"]
+
+  intent_outcome: "Allow"
+
+  execution:
+    started_at: "2026-05-19T15:42:33.119Z"
+    completed_at: "2026-05-19T15:42:33.531Z"
+    duration_ms: 412
+    result: "success"
+    # commit_hash populated post-execution
+    commit_hash: "8f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a"

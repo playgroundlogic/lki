@@ -1,0 +1,147 @@
+# Runtime PDP query shape for fetch_url
+# LKI format version: 0.1
+#
+# This document sketches how a concrete fetch_url invocation translates into
+# Cedar evaluation requests at runtime. It is the bridge between the LKI
+# spec's capability section and Cedar's request/decision API.
+#
+# Format: pseudo-code showing the resolver's behavior, not a runtime artifact.
+
+# ============================================================================
+# Scenario: Agent emits fetch_url intent with concrete parameter values
+# ============================================================================
+
+# Intent emitted by the agent (validated against LKI spec signature):
+intent:
+  name: fetch_url
+  version: "1.0.0"
+  parameters:
+    url: "https://api.github.com/repos/playgroundlogic/lki"
+    output: "/home/agent/workspace/lki-repo-info.json"
+    timeout: "30s"
+
+# Principal context (provided by Agenkit at request construction):
+principal:
+  id: "agent-session-abc123"
+  labels: ["research", "developer"]
+  working_dir: "/home/agent/workspace"
+  session_id: "sess-2026-05-18-001"
+
+# ============================================================================
+# Resolver: expand capability section against concrete parameter values
+# ============================================================================
+
+# The capability section of fetch_url.yaml declares:
+#   network:
+#     - direction: outbound
+#       host: "{url.host}"
+#       port: "{url.port}"
+#       protocol: "{url.scheme}"
+#   filesystem:
+#     - operation: write
+#       path: "{output}"
+#       required_if: "output is not null"
+
+# Resolved capability instances (after interpolation):
+resolved_capabilities:
+  - category: network
+    direction: outbound
+    host:
+      fqdn: "api.github.com"
+      is_loopback: false
+      is_private: false
+      is_metadata: false
+    port: 443
+    protocol: "https"
+
+  - category: filesystem
+    operation: write
+    path:
+      canonical: "/home/agent/workspace/lki-repo-info.json"
+      is_absolute: true
+      is_system_path: false
+      is_within_working_dir: true
+      extension: ".json"
+    recursive: false
+    follow_symlinks: false
+
+# ============================================================================
+# PDP requests: one per resolved capability
+# ============================================================================
+
+# Cedar request 1: network outbound check
+pdp_request_1:
+  principal: Lki::Principal::"agent-session-abc123"
+  action: Lki::Action::"Network::Outbound"
+  resource: Lki::Host::"api.github.com"
+  context:
+    port: 443
+    protocol: "https"
+    intent_name: "fetch_url"
+    intent_version: "1.0.0"
+
+# Expected decision: ALLOW (baseline policy: https + public host + fetch_url)
+# Policies evaluated:
+#   - Safety floor: passes (host is not metadata)
+#   - Baseline:     matches (https, fetch_url, not loopback, not private)
+#   - Tenant:       no applicable rules
+# Combined decision: Allow
+
+# Cedar request 2: filesystem write check
+pdp_request_2:
+  principal: Lki::Principal::"agent-session-abc123"
+  action: Lki::Action::"Filesystem::Write"
+  resource: Lki::FilePath::"/home/agent/workspace/lki-repo-info.json"
+  context:
+    recursive: false
+    follow_symlinks: false
+    intent_name: "fetch_url"
+    intent_version: "1.0.0"
+
+# Expected decision: ALLOW (baseline: within working_dir, not system path)
+
+# ============================================================================
+# Atomicity: all capabilities must allow for the intent to proceed
+# ============================================================================
+
+# The resolver invokes PDP once per resolved capability. ALL must return Allow
+# for the intent to execute. If ANY returns Deny, the entire intent fails with
+# structured diagnostic indicating which capability was denied and why.
+#
+# This is the "all-or-nothing" property at the intent level. A fetch_url that
+# can do the network but not the filesystem write does NOT silently drop the
+# write and return bytes — it fails atomically and the caller is told which
+# capability was denied.
+
+# ============================================================================
+# Audit log shape
+# ============================================================================
+
+# Regardless of PDP outcome, an audit entry is written:
+audit_entry:
+  timestamp: "2026-05-18T14:23:11.482Z"
+  principal_id: "agent-session-abc123"
+  session_id: "sess-2026-05-18-001"
+  intent_name: "fetch_url"
+  intent_version: "1.0.0"
+  intent_parameters:
+    url: "https://api.github.com/repos/playgroundlogic/lki"
+    output: "/home/agent/workspace/lki-repo-info.json"
+    timeout: "30s"
+  resolved_capabilities:
+    - "Network::Outbound on api.github.com:443/https"
+    - "Filesystem::Write on /home/agent/workspace/lki-repo-info.json"
+  pdp_decisions:
+    - request: 1
+      decision: "Allow"
+      determining_policies: ["baseline-network-https-public"]
+    - request: 2
+      decision: "Allow"
+      determining_policies: ["baseline-filesystem-working-dir"]
+  intent_outcome: "Allow"
+  execution_result: "success"  # only present if intent was allowed and executed
+  execution_duration_ms: 487
+
+# Audit entries are append-only, content-addressed (entry_hash = SHA256 of
+# canonicalized YAML form), and form the queryable data set for security
+# review, policy iteration, and Tool-SI training data refinement.

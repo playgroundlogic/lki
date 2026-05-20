@@ -1,0 +1,395 @@
+lki_version: "0.2"
+
+spec:
+  intent: write_file
+  intent_version: "2.0.0"
+  description: Write content to a file on the filesystem, atomically when possible.
+
+  types:
+    WriteResult:
+      type_version: "1.0.0"
+      structural_attributes:
+        path:
+          type: FilePath@1.x
+          description: "Canonical path of the written file"
+        bytes_written:
+          type: int
+          description: "Actual bytes written to disk (post-encoding)"
+        created:
+          type: bool
+          description: "True if the file did not exist before"
+        mode:
+          type: string
+          description: "Octal permissions of the file after write"
+
+  signature:
+    inputs:
+      - name: path
+        type: FilePath@1.x
+        constraint: "must be writable per policy; parent directory must exist unless create_parents is true"
+      - name: content
+        type: union<string, bytes>
+        description: |
+          Content to write. If string, encoded per encoding parameter
+          before write. If bytes, written directly.
+      - name: encoding
+        type: enum<utf_8, utf_16, latin_1, ascii>
+        default: utf_8
+        description: |
+          Used only when content is a string. Ignored if content is bytes.
+          Decoding failure produces an error before any write occurs.
+      - name: mode
+        type: enum<replace, append, create_new>
+        default: replace
+        description: |
+          replace: write content as the full file contents, overwriting
+          append: add content to end of existing file; creates if absent
+          create_new: write only if file does not exist; fails atomically if it does
+      - name: create_parents
+        type: bool
+        default: false
+        description: |
+          If true, missing parent directories are created (mkdir -p
+          semantics). Created directories use the principal's umask.
+      - name: permissions
+        type: string
+        optional: true
+        constraint: "must be 3 or 4 octal digits, e.g. '0644', '755'"
+        description: |
+          Explicit file permissions to set after write. If omitted,
+          permissions are determined by the umask and the file's prior
+          mode (for replace and append modes).
+      - name: atomic
+        type: bool
+        default: true
+        description: |
+          If true, write via temp-file-and-rename to ensure atomicity.
+      - name: fsync
+        type: bool
+        default: false
+        description: |
+          If true, fsync the file before considering the write complete.
+    output:
+      type: WriteResult@1.x
+      streaming: bounded
+
+  behavior: |
+    Write content to path per the chosen mode and atomicity settings.
+
+    Behavioral guarantees (normative for the contract):
+      - When atomic is true (default), the write happens via
+        temp-file-and-rename; the file's state is never partially-written
+        from another process's view
+      - When fsync is true, the write is durable against kernel crashes
+      - Encoding applied before write if content is a string; encoding
+        failure aborts the operation before any disk activity
+      - Path canonicalization happens before any write
+      - Symbolic links rejected unless explicit policy permits writing
+        through them
+      - System paths require explicit policy permission
+      - Content size + encoding overhead must not exceed available
+        filesystem space
+      - Permissions parameter cannot grant world-write without explicit
+        policy permission
+
+  constraints:
+    parameter_constraints: []
+    cross_parameter_constraints:
+      - description: "encoding parameter applies only to string content"
+        rule: "content is bytes implies encoding is_default"
+      - description: "create_parents only meaningful for replace and create_new modes"
+        rule: "create_parents == true implies mode != append or mode == append"
+
+  capability:
+    filesystem:
+      - operation: write
+        paths: ["{path}"]
+        recursive: false
+        follow_symlinks: false
+        canonical: true
+        purpose: user_facing
+        description: "Write to the target file at its canonical path"
+      - operation: write
+        paths: ["{path.parent}"]
+        recursive: false
+        follow_symlinks: false
+        canonical: true
+        purpose: implementation_detail
+        required_if: "atomic == true or create_parents == true"
+        description: |
+          Parent directory write needed for atomic temp-file creation or
+          for mkdir -p when create_parents is true.
+
+    # Three state_mutation declarations covering the three combinations
+    # of atomic and fsync. Each has different three-axis semantics.
+    # This verbose multi-entry pattern is the v0.2 workaround for
+    # parameter-dependent capability values; F-036 in FINDINGS_v0.2.md
+    # proposes a unified `cases:` mechanism for capability declarations
+    # to be added in v0.3.
+    state_mutation:
+      - operation: write
+        resource_type: FilePath@1.x
+        resource_identifier: "{path.canonical}"
+        visibility: rename_atomic
+        durability: fsynced
+        reversibility: irreversible
+        purpose: user_facing
+        required_if: "atomic == true and fsync == true"
+      - operation: write
+        resource_type: FilePath@1.x
+        resource_identifier: "{path.canonical}"
+        visibility: rename_atomic
+        durability: committed
+        reversibility: irreversible
+        purpose: user_facing
+        required_if: "atomic == true and fsync == false"
+      - operation: write
+        resource_type: FilePath@1.x
+        resource_identifier: "{path.canonical}"
+        visibility: immediate
+        durability: in_memory
+        reversibility: irreversible
+        purpose: user_facing
+        required_if: "atomic == false"
+
+    access_grant:
+      - operation: set_mode
+        resource: "filesystem:{path.canonical}"
+        granted_capability: "{permissions}"
+        purpose: user_facing
+        required_if: "permissions is not null"
+
+    process:
+      - operation: spawn
+        target: "mv"
+        uid_required: current
+        purpose: implementation_detail
+        required_if: "atomic == true"
+        description: "Atomic rename via mv"
+      - operation: spawn
+        target: "mktemp"
+        uid_required: current
+        purpose: implementation_detail
+        required_if: "atomic == true"
+        description: "Temp file creation for atomic write"
+      - operation: spawn
+        target: "mkdir"
+        uid_required: current
+        purpose: implementation_detail
+        required_if: "create_parents == true"
+      - operation: spawn
+        target: "chmod"
+        uid_required: current
+        purpose: implementation_detail
+        required_if: "permissions is not null"
+      - operation: spawn
+        target: "sync"
+        uid_required: current
+        purpose: implementation_detail
+        required_if: "fsync == true"
+
+  resolver_constraints:
+    shell_metacharacter_rejection:
+      - parameter: path
+        rule: "no shell metacharacters in path string"
+        reason: "Prevent shell injection in templates"
+    path_traversal_rejection:
+      - parameter: path
+        rule: "path with .. components rejected unless explicit policy permits"
+        reason: "Canonical path must satisfy policy bounds"
+    permissions_format:
+      - parameter: permissions
+        rule: "must match /^[0-7]{3,4}$/"
+        reason: "Octal mode bits only; no symbolic forms"
+    encoding_validation:
+      - parameter: content
+        rule: "must decode successfully using encoding when content is string"
+        reason: "Prevent partial-write on encoding failure"
+
+  internal_behaviors:
+    temp_file_cleanup:
+      - description: "On atomic write failure mid-operation, temp files are cleaned up where possible"
+        controllable_via_parameter: false
+        policy_relevance: |
+          Cleanup is best-effort; resolver crash between mktemp and mv may
+          leave orphaned temp files. These are policy-visible (audit log
+          notes creation but not cleanup).
+    cache_invalidation:
+      - description: "Kernel page cache for the file is invalidated on successful write"
+        controllable_via_parameter: false
+        policy_relevance: "Cache invalidation is automatic; not a policy concern"
+
+  implementation:
+    - tool: write
+      priority: 100
+      requires: "shell built-ins (printf) plus mv, mkdir, mktemp, chmod, sync"
+      tested_against: ["bash 5.x", "dash"]
+      # Shell built-ins (printf) referenced informally. NOTE: F-035 in
+      # FINDINGS_v0.2.md tracks the design question of whether shell
+      # built-ins need their own Tool entities or a separate annotation.
+      working_directory: "{path.parent}"
+      template:
+        cases:
+          - when: "atomic == true and mode == replace"
+            command: |
+              {parents_command}
+              tmpfile=$(mktemp --tmpdir={path.parent} '.{path.basename}.XXXXXX') && 
+              printf '%s' {content|shell_quoted} > "$tmpfile" && 
+              mv -- "$tmpfile" {path}
+              {permissions_command}
+              {fsync_command}
+          - when: "atomic == true and mode == append"
+            command: |
+              {parents_command}
+              printf '%s' {content|shell_quoted} >> {path}
+              {permissions_command}
+              {fsync_command}
+          - when: "atomic == true and mode == create_new"
+            command: |
+              {parents_command}
+              ( set -C; printf '%s' {content|shell_quoted} > {path} )
+              {permissions_command}
+              {fsync_command}
+          - when: "atomic == false and mode == replace"
+            command: |
+              {parents_command}
+              printf '%s' {content|shell_quoted} > {path}
+              {permissions_command}
+              {fsync_command}
+          - when: "atomic == false and mode == append"
+            command: |
+              {parents_command}
+              printf '%s' {content|shell_quoted} >> {path}
+              {permissions_command}
+              {fsync_command}
+          - when: "atomic == false and mode == create_new"
+            command: |
+              {parents_command}
+              ( set -C; printf '%s' {content|shell_quoted} > {path} )
+              {permissions_command}
+              {fsync_command}
+      parameter_mapping:
+        parents_command:
+          cases:
+            - when: "create_parents == true"
+              value: "mkdir -p -- {path.parent} && "
+            - default:
+              value: ""
+        permissions_command:
+          cases:
+            - when: "permissions is not null"
+              value: " && chmod {permissions} -- {path}"
+            - default:
+              value: ""
+        fsync_command:
+          cases:
+            - when: "fsync == true"
+              value: " && sync {path}"
+            - default:
+              value: ""
+      notes: |
+        The temp file naming pattern (.basename.XXXXXX) is a convention
+        to avoid leaving visible temp files in directory listings.
+        Encoding decoding happens at resolver layer before template
+        substitution (per Chapter 11 pipeline); template sees post-encoding
+        bytes. The 'shell builtins (printf)' reference in 'requires:' is
+        informal; F-035 tracks the design question.
+
+  examples:
+    - description: "Write a small text file, replacing if it exists"
+      intent:
+        path: "/home/agent/workspace/output.txt"
+        content: "Hello, LKI.\n"
+      expected_command: |
+        tmpfile=$(mktemp --tmpdir=/home/agent/workspace '.output.txt.XXXXXX') && 
+        printf '%s' 'Hello, LKI.
+        ' > "$tmpfile" && 
+        mv -- "$tmpfile" /home/agent/workspace/output.txt
+
+    - description: "Append a log line to an existing file"
+      intent:
+        path: "/home/agent/workspace/run.log"
+        content: "2026-05-18T15:42:01Z run completed\n"
+        mode: append
+      expected_command: |
+        printf '%s' '2026-05-18T15:42:01Z run completed
+        ' >> /home/agent/workspace/run.log
+
+    - description: "Create new file, fail if it exists, with explicit permissions"
+      intent:
+        path: "/home/agent/workspace/secrets/api-token"
+        content: "sk-redacted-example-token"
+        mode: create_new
+        permissions: "0600"
+      expected_command: |
+        ( set -C; printf '%s' 'sk-redacted-example-token' > /home/agent/workspace/secrets/api-token )
+         && chmod 0600 -- /home/agent/workspace/secrets/api-token
+
+    - description: "Write with parent directory creation"
+      intent:
+        path: "/home/agent/workspace/build/output/result.json"
+        content: '{"status":"complete"}'
+        create_parents: true
+      expected_command: |
+        mkdir -p -- /home/agent/workspace/build/output && 
+        tmpfile=$(mktemp --tmpdir=/home/agent/workspace/build/output '.result.json.XXXXXX') && 
+        printf '%s' '{"status":"complete"}' > "$tmpfile" && 
+        mv -- "$tmpfile" /home/agent/workspace/build/output/result.json
+
+  anti_patterns:
+    - bad: 'echo "data" > /etc/cron.d/agent-job'
+      reason: "Write to system path enables privilege escalation via cron."
+      rejection: |
+        path canonicalization combined with FilePath.is_system_path = true
+        (covering /etc tree) triggers Cedar safety floor policy denial.
+
+    - bad: 'echo "$USER_INPUT" > /tmp/script.sh && chmod +x /tmp/script.sh'
+      reason: |
+        Writing executable scripts with agent-controlled content is a
+        common path to RCE.
+      rejection: |
+        write_file does not couple to chmod execution; permissions
+        parameter accepts only mode bits, not capability changes. Cedar
+        policy denies access_grant operations that grant execute
+        permission to non-policy-permitted paths.
+
+    - bad: 'echo "data" > "${OUTPUT_PATH}/result.txt"'
+      reason: "Unbounded path composition can write to unintended locations."
+      rejection: |
+        Path resolved at intent construction. Path components from
+        agent-controlled strings are resolved to literal canonical paths
+        before policy check; OUTPUT_PATH composition happens before LKI
+        sees the intent.
+
+    - bad: 'echo "data" >> /var/log/agent.log'
+      reason: |
+        Appending to system log paths can interleave with system logging
+        or fill disk space affecting other services.
+      rejection: |
+        /var/log satisfies FilePath.is_system_path = true (via /var
+        tree). Cedar safety floor policy forbids writes to system paths.
+
+    - bad: 'cat huge-input | tee /home/agent/workspace/output.txt'
+      reason: |
+        Pipe-fed content is unbounded from the policy perspective at
+        intent-construction time; no max_size enforcement.
+      rejection: |
+        write_file content parameter has known size at intent construction.
+        Streaming writes are a separate intent (write_file_streaming,
+        future) that declares its size-bound capability differently.
+
+    - bad: 'echo "data" > /home/agent/workspace/symlink-to-elsewhere'
+      reason: |
+        Writing through a symlink can effect changes outside the
+        intended scope.
+      rejection: |
+        follow_symlinks default is false. Resolver detects symlink at
+        canonicalization and rejects the write unless explicit policy
+        permits write-through-symlink for this path.
+
+    - bad: 'echo "data" > /home/agent/workspace/file && chmod 777 /home/agent/workspace/file'
+      reason: "World-writable files are an access control problem."
+      rejection: |
+        access_grant capability for set_mode is independently policy-checked.
+        Cedar safety floor (or baseline) denies grants of world-write
+        permission unless explicit tenant policy permits.

