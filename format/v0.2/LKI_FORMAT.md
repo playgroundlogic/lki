@@ -4,8 +4,8 @@
 **Format version:** `0.2`
 **Released:** 2026-05-19
 **Predecessor:** [LKI_FORMAT_v0.1.md](../v0.1/LKI_FORMAT.md)
-**Migration guide:** [MIGRATION_FROM_v0.1.md](./MIGRATION_FROM_v0.1.md)
-**Findings against this version:** [FINDINGS_v0.2.md](./FINDINGS_v0.2.md)
+**Migration guide:** [MIGRATION_FROM_v0.1.md](../../migrations/v0.1-to-v0.2.md)
+**Findings against this version:** [FINDINGS_v0.2.md](../../findings/v0.2.md)
 
 ## What's new from v0.1
 

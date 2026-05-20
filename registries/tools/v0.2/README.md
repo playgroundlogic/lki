@@ -23,6 +23,6 @@ specs:
 | mv, mkdir, mktemp, chmod, sync | write_file | Multiple coreutils |
 
 Shell built-ins (printf) used in write_file are tracked under F-035 in
-[../../findings/v0.2.md](../../findings/v0.2.md) — the design
+[../../findings/v0.2.md](../../../findings/v0.2.md) — the design
 question of whether shell built-ins need their own Tool entities is
 pending v0.3.
