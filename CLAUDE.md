@@ -18,8 +18,10 @@ project. Read it first; it tells you what to read next.
 |---|---|
 | Edit or migrate a spec | [migrations/v0.1-to-v0.2.md](migrations/v0.1-to-v0.2.md) plus the spec in question |
 | Add a new finding | Tail of [findings/v0.2.md](findings/v0.2.md) for the format and tone |
-| Implement `cedar-from-lki` | Chapter 9 of format spec + both v2.0.0 projections under [projections/](projections/) |
-| Implement `lki-validate` | The full format spec; this is the one task where reading all 3476 lines is justified |
+| Implement any tool | [TOOLING.md](TOOLING.md) for layout, conventions, and dependencies |
+| Implement `cedar-from-lki` | [cmd/cedar-from-lki/README.md](cmd/cedar-from-lki/README.md), Chapter 9 of format spec, both v2.0.0 projections under [projections/](projections/) |
+| Implement `lki-validate` | [cmd/lki-validate/README.md](cmd/lki-validate/README.md) and the full format spec |
+| Implement `lki-migrate` | [cmd/lki-migrate/README.md](cmd/lki-migrate/README.md) and [migrations/v0.1-to-v0.2.md](migrations/v0.1-to-v0.2.md) |
 | Work on flight plan compiler | [design/flight-plan-goalpost.md](design/flight-plan-goalpost.md) — this is the target |
 | Understand falconry vocabulary | See "Vocabulary" section below |
 
@@ -109,6 +111,8 @@ lki/
 ├── README.md                              # Project elevator pitch (placeholder; Maya rewrites)
 ├── LICENSE                                # Apache 2.0
 ├── CLAUDE.md                              # This file
+├── TOOLING.md                             # Tooling overview (Go packages, binaries)
+├── go.mod                                 # Go module: github.com/playgroundlogic/lki
 ├── .gitignore
 │
 ├── format/v0.<n>/LKI_FORMAT.md            # Format specification per version
@@ -127,8 +131,18 @@ lki/
 ├── findings/v0.<n>.md                     # Findings per format version (open until next ships)
 ├── migrations/v0.<n>-to-v0.<n+1>.md       # Migration guides per format transition
 ├── decisions/v0.<n>-triage.md             # Triage decisions for version transitions
-└── design/                                # Forward-looking design docs (not yet specs)
-    └── flight-plan-goalpost.md            # Target user-facing layer above LKI
+├── design/                                # Forward-looking design docs (not yet specs)
+│   └── flight-plan-goalpost.md            # Target user-facing layer above LKI
+│
+├── cmd/                                   # Tool binaries (Go)
+│   ├── cedar-from-lki/                    # Project specs to Cedar artifacts
+│   ├── lki-validate/                      # Validate specs against the format
+│   └── lki-migrate/                       # Mechanical migrations between versions
+│
+└── internal/                              # Shared Go packages (not for external import)
+    ├── spec/                              # Parse and validate LKI specs
+    ├── cedar/                             # Emit Cedar artifacts
+    └── projection/                        # Apply Chapter 9 projection rules
 ```
 
 Directories ending in `/v0.<n>/` are versioned. Directories without
